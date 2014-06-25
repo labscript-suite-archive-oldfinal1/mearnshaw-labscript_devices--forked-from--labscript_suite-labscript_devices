@@ -1,14 +1,3 @@
-from __future__ import absolute_import
-
-import os
-import sys
-import importlib
-
-__version__ = '0.1.0-dev'
-
-<<<<<<< local
-from labscript_devices.classregister import *
-=======
 class ClassRegister(object):
     """A register for looking up classes by module name.  Provides a
      decorator and a method for looking up classes decorated with it,
@@ -86,6 +75,3 @@ def get_BLACS_worker(name):
         
 def get_runviewer_parser(name):
     return runviewer_parser[name]
-    
-
->>>>>>> other
