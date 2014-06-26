@@ -116,18 +116,15 @@ class PulseBlaster(PseudoclockDevice):
         return self._direct_output_device
     
     def add_device(self, device):
-        if not self.child_devices and isinstance(device, Pseudoclock):
-            PseudoclockDevice.add_device(self, device)
-            
-        elif isinstance(device, Pseudoclock):
-            raise LabscriptError('The %s %s automatically creates a Pseudoclock because it only supports one. '%(self.description, self.name) +
-                                 'Instead of instantiating your own Pseudoclock object, please use the internal' +
-                                 ' one stored in %s.pseudoclock'%self.name)
-        elif isinstance(device, DDS) or isinstance(device, DigitalOut):
-            #TODO: Defensive programming: device.name may not exist!
-            raise LabscriptError('You have connected %s directly to %s, which is not allowed. You should instead specify the parent_device of %s as %s.direct_outputs'%(device.name, self.name, device.name, self.name))
+        if isinstance(device, Pseudoclock):
+            if not any([isinstance(device, Pseudoclock) for device in self.child_devices]):
+                PseudoclockDevice.add_device(self, device)
+            else:
+                raise LabscriptError("The {description} {name} automatically creates a Pseudoclock because it only supports one.\
+                                        Instead of instantiating your own Pseudoclock object, please use the \
+                                        internal one stored in {name}.pseudoclock".format(description=self.description, name=self.name)
         else:
-            raise LabscriptError('You have connected %s (class %s) to %s, but %s does not support children with that class.'%(device.name, device.__class__, self.name, self.name))
+            PseudoclockDevice.add_device(self, device)
                 
     def flag_valid(self, flag):
         if -1 < flag < self.n_flags:
@@ -191,9 +188,9 @@ class PulseBlaster(PseudoclockDevice):
                 
                 # store a reference to the output
                 if isinstance(output, DigitalOut):
-                	dig_outputs.append(output)
+                    dig_outputs.append(output)
                 elif isinstance(output, DDS):
-                	dds_outputs.append(output)
+                    dds_outputs.append(output)
                 
         return dig_outputs, dds_outputs
 
