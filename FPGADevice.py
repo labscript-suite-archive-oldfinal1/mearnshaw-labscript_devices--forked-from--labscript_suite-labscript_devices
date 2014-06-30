@@ -4,7 +4,7 @@ from labscript_devices import labscript_device  #, BLACS_tab, BLACS_worker, runv
 
 from labscript import PseudoclockDevice, Pseudoclock, ClockLine, IntermediateDevice,\
     AnalogOut, DigitalOut, LabscriptError
-    
+
 import numpy as np
 
 # Example
@@ -22,55 +22,80 @@ import numpy as np
 # stop(1)
 
 
+def convert_to_clocks_and_toggles(clock, output, clock_limit, clock_resolution):
+    """ Given a list of step/reps dictionaries 
+    (as returned in .clock by Pseudoclock.generate_code),
+    return list of clocks/toggles dictionaries (see below)
+
+    n_clocks: some number of clock cycles
+    toggles: number of times to change clock during this number of cycles
+    """
+    ct_clock = []
+
+    for i, tick in enumerate(clock):
+
+        # For digital outputs, the first (toggles)/(clocks)
+        # specifies (the inital state)/(# clocks to hold it for)
+        # NB. n_clocks=n => wait n-1 clock cycles before toggling
+        if i == 0 and isinstance(output, DigitalOut):
+            initial_state = output.raw_output[0]
+            period = int(round(tick['step'] / clock_resolution)) * clock_resolution
+            n_clocks = (period / clock_limit) - 1
+            ct_clock.append({'n_clocks': n_clocks, 'toggles': initial_state})
+            tick['reps'] -= 1  # have essentially dealt with 1 rep above
+
+        period = int(round(tick['step'] / clock_resolution)) * clock_resolution
+        toggles = tick['reps']
+        n_clocks = (period * clock_limit) - 1
+        ct_clock.append({'n_clocks': n_clocks, 'toggles': toggles})
+
+    return ct_clock
+
+
 @labscript_device
 class FPGADevice(PseudoclockDevice):
     """ A device with indiviually pseudoclocked outputs. """
 
-    clock_limit = 1e6  # true value??
+    clock_limit = 10e6  # true value??
     clock_resolution = 1e-9  # true value??
 
     description = "FPGA-Device"
     allowed_children = [Pseudoclock]
 
-    def __init__(self, name, usb_port, trigger_device=None, trigger_connection=None):
+    def __init__(self, name, usb_port, max_outputs=None, trigger_device=None, trigger_connection=None):
         PseudoclockDevice.__init__(self, name, trigger_device, trigger_connection)
 
         self.BLACS_connection = usb_port
+
+        self.max_outputs = max_outputs
 
         self.pseudoclocks = []
         self.clocklines = []
         self.output_devices = []
 
-        """
-        # Create the internal pseudoclocks and clocklines, and the outputs
-        for n in range(n_outputs):
-            pc = Pseudoclock("fpga_pseudoclock{}".format(n), self, "clock_{}".format(n))
-            self.pseudoclocks.append(pc)
-
-            # Create the internal direct output clock_line
-            cl = ClockLine("fpga_output{}_clock_line".format(n), pc, "fpga_internal{}".format(n))
-            self.clocklines.append(cl)
-
-            # Create the internal intermediate device (outputs) connected to the above clock line
-            self.output_devices.append(OutputIntermediateDevice("fpga_output_device{}".format(n), cl))
-        """
+    # restrict devices here?
+    #def add_device(...):
 
     @property
     def outputs(self):
         """ Return an output device to which an output can be connected. """
         n = len(self.pseudoclocks)  # the number identifying this new output (zero indexed)
-        pc = Pseudoclock("fpga_pseudoclock{}".format(n), self, "clock_{}".format(n))
-        self.pseudoclocks.append(pc)
 
-        # Create the internal direct output clock_line
-        cl = ClockLine("fpga_output{}_clock_line".format(n), pc, "fpga_internal{}".format(n))
-        # do we really need to store the list of clocklines?
-        self.clocklines.append(cl)
+        if n == self.max_outputs:
+            raise LabscriptError("Cannot connect more than {} outputs to the device '{}'".format(n, self.name))
+        else:
+            pc = Pseudoclock("fpga_pseudoclock{}".format(n), self, "clock_{}".format(n))
+            self.pseudoclocks.append(pc)
 
-        # Create the internal intermediate device (outputs) connected to the above clock line
-        oid = OutputIntermediateDevice("fpga_output_device{}".format(n), cl)
-        self.output_devices.append(oid)
-        return oid
+            # Create the internal direct output clock_line
+            cl = ClockLine("fpga_output{}_clock_line".format(n), pc, "fpga_internal{}".format(n))
+            # do we really need to store the list of clocklines?
+            self.clocklines.append(cl)
+
+            # Create the internal intermediate device (outputs) connected to the above clock line
+            oid = OutputIntermediateDevice("fpga_output_device{}".format(n), cl)
+            self.output_devices.append(oid)
+            return oid
 
     def generate_code(self, hdf5_file):
         PseudoclockDevice.generate_code(self, hdf5_file)
@@ -82,26 +107,38 @@ class FPGADevice(PseudoclockDevice):
         for i, pseudoclock in enumerate(self.pseudoclocks):
 
             output = self.output_devices[i].get_all_outputs()[0]  # improve the class API to make this nicer?
+
+            # this check might not be necessary, this condition shouldn't occur in any normal usage
             if output is None:
                 raise LabscriptError("OutputDevice '{}' has no Output connected!".format(self.output_devices[i].name))
 
             # process the clock
-            clock = np.zeros(len(pseudoclock.clock), dtype=[('period', int), ('reps', int)])
+            ct_clock = convert_to_clocks_and_toggles(pseudoclock.clock, output, self.clock_limit, self.clock_resolution)
+            clock = np.zeros(len(ct_clock), dtype=[('n_clocks', int), ('toggles', int)])
+            #clock = np.zeros(len(pseudoclock.clock), dtype=[('period', int), ('reps', int)])
 
-            for j, tick in enumerate(pseudoclock.clock):
-                period = int(round(tick['step'] / self.clock_resolution))
-                clock[j]['period'] = period
-                clock[j]['reps'] = tick['reps']
+            for j, tick in enumerate(ct_clock):
+                clock[j]['n_clocks'] = tick['n_clocks']
+                clock[j]['toggles'] = tick['toggles']
 
             device_group.create_dataset("clocks/{}".format(output.name), data=clock)  # compression ...?
 
-            output_data = output.raw_output
+            """
+            ### Period and reps clocks ###
+            pr_clock = np.zeros(len(pseudoclock.clock), dtype=[('period', int), ('reps', int)])
+            for j, tick in enumerate(pseudoclock.clock):
+                period = int(round(tick['step'] / self.clock_resolution))
+                pr_clock[j]['period'] = period
+                pr_clock[j]['reps'] = tick['reps']
 
-            data_group = device_group.create_dataset("data/{}".format(output.name), data=output_data)  # compression ?
+            device_group.create_dataset("pr_clocks/{}".format(output.name), data=pr_clock)  # compression ...?
+            """
 
-            # store the type of output, we don't really need the digital output data because we just update on tick (but how to know initial state?)
-            data_group.attrs['type'] = output.__class__.__name__
-            
+        # we only need to save analog data, digital outputs are updated directly by clocking signal
+        if isinstance(output, AnalogOut):
+            analog_data = output.raw_output
+            device_group.create_dataset("analog_data/{}".format(output.name), data=analog_data)  # compression ?
+
         # do we need this?
         device_group.attrs['stop_time'] = self.stop_time
 
@@ -124,7 +161,7 @@ class OutputIntermediateDevice(IntermediateDevice):
 
         if self.child_devices:
             raise LabscriptError("Output '{}' is already connected to the OutputIntermediateDevice '{}'. Only one output is allowed.".format(
-                self.child_devices[0].name,  self.name))
+                self.child_devices[0].name, self.name))
         else:
             IntermediateDevice.add_device(self, device)
             self.output = device  # store reference to the output
