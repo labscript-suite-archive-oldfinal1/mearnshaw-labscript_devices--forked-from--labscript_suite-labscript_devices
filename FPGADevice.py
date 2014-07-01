@@ -21,9 +21,28 @@ import numpy as np
 # analog0.ramp(0, duration=3, initial=0, final=1, samplerate=1e4)
 # stop(1)
 
+def reduce_clock_instructions(clock, clock_resolution):
+    """ Combine consecutive instructions with the same period. """
+
+    reduced_instructions = []
+    for instruction in clock:
+        if instruction == 'WAIT':
+            # The following period and reps indicates a wait instruction
+            reduced_instructions.append({'step': 0, 'reps': 1})
+            continue
+        reps = instruction['reps']
+        step = instruction['step']
+        # see if previous instruction has same 'step' (period) as current
+        if reduced_instructions and (reduced_instructions[-1]['step'] == step):
+            reduced_instructions[-1]['reps'] += reps
+        else:
+            reduced_instructions.append({'step': step, 'reps': reps})
+    # add stop instruction
+    return reduced_instructions
+
 
 def convert_to_clocks_and_toggles(clock, output, clock_limit, clock_resolution):
-    """ Given a list of step/reps dictionaries 
+    """ Given a list of step/reps dictionaries
     (as returned in .clock by Pseudoclock.generate_code),
     return list of clocks/toggles dictionaries (see below)
 
@@ -34,19 +53,27 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit, clock_resolution):
 
     for i, tick in enumerate(clock):
 
-        # For digital outputs, the first (toggles)/(clocks)
-        # specifies (the inital state)/(# clocks to hold it for)
+        # the first (toggles)/(clocks) specifies (the inital state)/(# clocks to hold it for)
         # NB. n_clocks=n => wait n-1 clock cycles before toggling
-        if i == 0 and isinstance(output, DigitalOut):
-            initial_state = output.raw_output[0]
-            period = int(round(tick['step'] / clock_resolution)) * clock_resolution
-            n_clocks = (period / clock_limit) - 1
+        if i == 0:
+            if isinstance(output, DigitalOut):
+                initial_state = output.raw_output[0]
+            elif isinstance(output, AnalogOut):
+                # for analog outputs board expects zero as initial clock state
+                initial_state = 0
+            else:
+                raise LabscriptError("Conversion to clocks and toggles not supported for output type '{}'.".format(output.__class__.__name__))
+
+            # get period rounded to clock resolution
+            #period = int(round(tick['step'] / clock_resolution) * clock_resolution)
+            #n_clocks = (period / clock_limit) - 1
+            n_clocks = tick['step'] - 1
             ct_clock.append({'n_clocks': n_clocks, 'toggles': initial_state})
             tick['reps'] -= 1  # have essentially dealt with 1 rep above
 
-        period = int(round(tick['step'] / clock_resolution)) * clock_resolution
+        #period = int(round(tick['step'] / clock_resolution) * clock_resolution)
         toggles = tick['reps']
-        n_clocks = (period * clock_limit) - 1
+        n_clocks = tick['step'] - 1
         ct_clock.append({'n_clocks': n_clocks, 'toggles': toggles})
 
     return ct_clock
@@ -107,12 +134,22 @@ class FPGADevice(PseudoclockDevice):
         for i, pseudoclock in enumerate(self.pseudoclocks):
 
             output = self.output_devices[i].get_all_outputs()[0]  # improve the class API to make this nicer?
+            
+            # restrict connection names (for BLACS)
+            try:
+                prefix, channel = output.connection.split(' ')
+                assert prefix == "channel"
+                channel = int(channel)
+            except (ValueError, AssertionError):
+                raise LabscriptError("{} {} has invalid connection string '{}'. Format must be 'channel #'.".format(output.description,
+                                                                                                                    output.name, str(output.connection)))
 
             # this check might not be necessary, this condition shouldn't occur in any normal usage
             if output is None:
                 raise LabscriptError("OutputDevice '{}' has no Output connected!".format(self.output_devices[i].name))
 
             # process the clock
+            pseudoclock.clock = reduce_clock_instructions(pseudoclock.clock, self.clock_resolution)
             ct_clock = convert_to_clocks_and_toggles(pseudoclock.clock, output, self.clock_limit, self.clock_resolution)
             clock = np.zeros(len(ct_clock), dtype=[('n_clocks', int), ('toggles', int)])
             #clock = np.zeros(len(pseudoclock.clock), dtype=[('period', int), ('reps', int)])
@@ -125,22 +162,31 @@ class FPGADevice(PseudoclockDevice):
 
             """
             ### Period and reps clocks ###
+            #pseudoclock.clock = reduce_clock_instructions(pseudoclock.clock, self.clock_resolution)
             pr_clock = np.zeros(len(pseudoclock.clock), dtype=[('period', int), ('reps', int)])
+            #raw_clock = np.zeros(len(pseudoclock.clock), dtype=[('step', int), ('reps', int), ('start', float), ('enabled_clocks', bool)])
             for j, tick in enumerate(pseudoclock.clock):
-                period = int(round(tick['step'] / self.clock_resolution))
-                pr_clock[j]['period'] = period
+                #period = int(round(tick['step'] / self.clock_resolution)) * self.clock_resolution
+                pr_clock[j]['period'] = tick['step']
                 pr_clock[j]['reps'] = tick['reps']
 
+                raw_clock[j]['reps'] = tick['reps']
+                raw_clock[j]['start'] = tick['start']
+                raw_clock[j]['enabled_clocks'] = tick['enabled_clocks']
+                raw_clock[j]['step'] = tick['step']
+
+
             device_group.create_dataset("pr_clocks/{}".format(output.name), data=pr_clock)  # compression ...?
+            #device_group.create_dataset("raw_clocks/{}".format(output.name), data=raw_clock)  # delete me
             """
 
-        # we only need to save analog data, digital outputs are updated directly by clocking signal
-        if isinstance(output, AnalogOut):
-            analog_data = output.raw_output
-            device_group.create_dataset("analog_data/{}".format(output.name), data=analog_data)  # compression ?
+            # we only need to save analog data, digital outputs are updated directly by clocking signal
+            if isinstance(output, AnalogOut):
+                analog_data = output.raw_output
+                device_group.create_dataset("analog_data/{}".format(output.name), data=analog_data)  # compression ?
 
-        # do we need this?
-        device_group.attrs['stop_time'] = self.stop_time
+            # do we need this?
+            device_group.attrs['stop_time'] = self.stop_time
 
 
 class OutputIntermediateDevice(IntermediateDevice):
@@ -181,9 +227,17 @@ from blacs.device_base_class import DeviceTab
 class FPGADeviceTab(DeviceTab):
 
     def initialise_GUI(self):
+        self.num_DO = 5  # placeholder
+        self.num_AO = 5  # placeholder
+
+        #self.digital_properties = 
         dds_widgets, ao_widgets, do_widgets = self.auto_place_widgets()
 
 
 @BLACS_worker
 class FPGADeviceWorker(Worker):
-    pass
+    
+    def init(self):
+        pass
+        #global fpga_api; import fpga_api  # documentation says to do it like this...
+        #self.interface = fpga_api
