@@ -174,25 +174,8 @@ class FPGADevice(PseudoclockDevice):
             except ValueError:
                 raise LabscriptError("{} {} has invalid connection string '{}'. Format must be 'channel #'.".format(output.description,
                                                                                                                     output.name, str(output.connection)))
-            # Period and reps clocks (testing purposes only)
-            raw_clock = np.zeros(len(pseudoclock.clock), dtype=[('step', float), ('reps', float), ('start', float), ('enabled_clocks', bool)])
-            for j, tick in enumerate(pseudoclock.clock):
-                raw_clock[j]['step'] = tick['step']
-                raw_clock[j]['reps'] = tick['reps']
-                raw_clock[j]['start'] = tick['start']
-                raw_clock[j]['enabled_clocks'] = tick['enabled_clocks']
-
-            rc = reduce_clock_instructions(pseudoclock.clock)  # , self.clock_resolution)
-            reduced_clock = np.zeros(len(rc), dtype=[('step', float), ('reps', float)])
-            for j, tick in enumerate(rc):
-                reduced_clock[j]['step'] = tick['step']
-                reduced_clock[j]['reps'] = tick['reps']
-
-            device_group.create_dataset("raw_clocks/{}".format(output.name), data=raw_clock)  # delete me
-            device_group.create_dataset("reduced_clocks/{}".format(output.name), data=reduced_clock)  # delete me
-
             # combine instructions with equal periods
-            pseudoclock.clock = reduced_clock
+            pseudoclock.clock = reduce_clock_instructions(pseudoclock.clock)  # , self.clock_resolution)
 
             # change from period/reps system to clocks/toggles (see function for explanation)
             ct_clock = convert_to_clocks_and_toggles(pseudoclock.clock, output, self.clock_limit)  # , self.clock_resolution)
