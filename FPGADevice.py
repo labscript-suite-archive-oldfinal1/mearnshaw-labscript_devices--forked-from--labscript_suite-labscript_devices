@@ -71,7 +71,7 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
             else:
                 raise LabscriptError("Conversion to clocks and toggles not supported for output type '{}'.".format(output.__class__.__name__))
 
-            n_clocks = (tick['step'] * clock_limit) - 1
+            n_clocks = int(tick['step'] * clock_limit) - 1
             ct_clock.append((n_clocks, initial_state))
             tick['reps'] -= 1  # have essentially dealt with 1 rep above
         
@@ -81,7 +81,7 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
 
         #period = int(round(tick['step'] / clock_resolution) * clock_resolution)
         toggles = tick['reps']
-        n_clocks = (tick['step'] * clock_limit) - 1
+        n_clocks = int(tick['step'] * clock_limit) - 1
         ct_clock.append((n_clocks, toggles))
 
     return ct_clock
