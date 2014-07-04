@@ -6,6 +6,9 @@ from labscript import PseudoclockDevice, Pseudoclock, ClockLine, IntermediateDev
     AnalogOut, DigitalOut, LabscriptError, config
 
 import numpy as np
+import h5py
+
+from labscript_devices import fpga_api
 
 # Example
 #
@@ -97,14 +100,15 @@ class FPGADevice(PseudoclockDevice):
     description = "FPGA-Device"
     allowed_children = [Pseudoclock]
 
-    def __init__(self, name, usb_port, max_outputs=None):
+    def __init__(self, name, usb_port, n_analog=5, n_digital=5):
         # device is triggered by PC, so trigger device is None and this device becomes the master_pseudoclock
         PseudoclockDevice.__init__(self, name)
 
         self.BLACS_connection = usb_port
 
-        # FIXME: probably better to have max_analog / max_digital?
-        self.max_outputs = max_outputs
+        # number of outputs of each type that device should have
+        self.n_analog = n_analog
+        self.n_digital = n_digital
 
         self.pseudoclocks = []
         self.clocklines = []
@@ -118,7 +122,7 @@ class FPGADevice(PseudoclockDevice):
         """ Return an output device to which an output can be connected. """
         n = len(self.pseudoclocks)  # the number identifying this new output (zero indexed)
 
-        if n == self.max_outputs:
+        if n == (self.n_digital + self.n_analog):
             raise LabscriptError("Cannot connect more than {} outputs to the device '{}'".format(n, self.name))
         else:
             pc = Pseudoclock("fpga_pseudoclock{}".format(n), self, "clock_{}".format(n))
@@ -135,6 +139,18 @@ class FPGADevice(PseudoclockDevice):
             return oid
 
     def generate_code(self, hdf5_file):
+        # check that correct number of outputs are attached
+        outputs = [output_device.output.__class__ for output_device in self.output_devices]
+
+        n_analog = outputs.count(AnalogOut)
+        n_digital = outputs.count(DigitalOut)
+
+        if (self.n_analog != n_analog) or (self.n_digital != n_digital):
+            raise LabscriptError("FPGADevice '{}' does not have enough outputs attached. "
+                                 "Expected {} digital, {} analog but found {} digital, {} analog".format(self.name,
+                                                                                                         self.n_digital, self.n_analog,
+                                                                                                         n_digital, n_analog))
+
         PseudoclockDevice.generate_code(self, hdf5_file)
 
         # group in which to save instructions for this device
@@ -150,12 +166,12 @@ class FPGADevice(PseudoclockDevice):
             # restrict connection names (for BLACS)
             try:
                 prefix, channel = output.connection.split(' ')
-                if prefix != "channel":
+                if prefix != "analog" and prefix != "digital":
                     raise ValueError
                 channel = int(channel)
             except ValueError:
-                raise LabscriptError("{} {} has invalid connection string '{}'. Format must be 'channel #'.".format(output.description,
-                                                                                                                    output.name, str(output.connection)))
+                raise LabscriptError("{} {} has invalid connection string '{}'. Format must be 'analog|digital #'.".format(output.description,
+                                                                                                                           output.name, str(output.connection)))
             # combine instructions with equal periods
             pseudoclock.clock = reduce_clock_instructions(pseudoclock.clock)  # , self.clock_resolution)
 
@@ -217,33 +233,161 @@ from blacs.device_base_class import DeviceTab
 class FPGADeviceTab(DeviceTab):
 
     def initialise_GUI(self):
-        self.num_DO = 5  # placeholder
-        self.num_AO = 5  # placeholder
+        
+        # placeholder values - how to make them dynamic?
+        self.num_DO = 5
+        self.num_AO = 5
 
-        # self.base_units = 'Hz'
+        self.base_units = 'Hz'
         # self.base_min
         # self.base_max
         # self.base_step
         # self.base_decimals
 
-        #self.digital_properties = {}
-        #self.analog_properties = {}
-        self.create_analog_outputs(self.analog_properties)
-        self.create_digital_outputs(self.digital_properties)
-        dds_widgets, ao_widgets, do_widgets = self.auto_create_widgets()
+        digital_properties = {}
+        for i in range(self.num_DO):
+            digital_properties["digital %s" % i] = {}
+        
+        # properties['base_unit'], properties['min'], properties['max'], properties['step'], properties['decimals']
+        analog_properties = {}
+        for i in range(self.num_AO):
+            analog_properties["analog %s" % i] = {'base_unit': self.base_units,
+                                                  'min': 0, 'max': 10, 'step': 1, 'decimals': 1}
+
+        self.create_analog_outputs(analog_properties)
+        self.create_digital_outputs(digital_properties)
+        DDS_widgets, AO_widgets, DO_widgets = self.auto_create_widgets()
+        self.auto_place_widgets(AO_widgets, DO_widgets)
 
         self.supports_smart_programming(True)
 
-        # self.usb_port = self.settings['connection_table'].find_by_name(self.device_name).usb_port
-        # self.create_worker("main_worker", FPGADeviceWorker, {'usb_port': self.usb_port})
-        # self.primary_worker = "main_worker"
+    def initialise_workers(self):
+        self.usb_port = self.settings['connection_table'].find_by_name(self.device_name).BLACS_connection
+        self.create_worker("main_worker", FPGADeviceWorker, {'usb_port': self.usb_port})
+        self.primary_worker = "main_worker"
+
+    @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
+    def status_monitor(self, notify_queue=None):
+        """ Get status of FPGA and update the widgets in BLACS accordingly. """
+        # When called with a queue, this function writes to the queue
+        # when the pulseblaster is waiting. This indicates the end of
+        # an experimental run.
+        self.status, waits_pending = yield(self.queue_work(self.primary_worker, 'check_status'))
+        
+        if notify_queue is not None and self.status['waiting'] and not waits_pending:
+            # Experiment is over. Tell the queue manager about it, then
+            # set the status checking timeout back to every 2 seconds
+            # with no queue.
+            notify_queue.put('done')
+            self.statemachine_timeout_remove(self.status_monitor)
+            self.statemachine_timeout_add(2000, self.status_monitor)
+        
+        # TODO: Update widgets
+        # a = ['stopped','reset','running','waiting']
+        # for name in a:
+            # if self.status[name] == True:
+                # self.status_widgets[name+'_no'].hide()
+                # self.status_widgets[name+'_yes'].show()
+            # else:                
+                # self.status_widgets[name+'_no'].show()
+                # self.status_widgets[name+'_yes'].hide()
+        
+ 
+    @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
+    def start(self, widget=None):
+        yield(self.queue_work(self.primary_worker, 'fpga_start'))
+        self.status_monitor()
+
+    @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
+    def stop(self, widget=None):
+        yield(self.queue_work(self.primary_worker, 'fpga_stop'))
+        self.status_monitor()
+
+    @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
+    def reset(self, widget=None):
+        yield(self.queue_work(self.primary_worker, 'fpga_reset'))
+        self.status_monitor()
+
+    @define_state(MODE_BUFFERED, True)
+    def start_run(self, notify_queue):
+        """ function called by Queue Manager to begin a buffered shot. """
+        # stop monitoring the device status
+        self.statemachine_timeout_remove(self.status_monitor)
+        # start the shot
+        self.start()
+        # poll status every 100ms to notify Queue Manager at end of shot
+        self.statemachine_timeout_add(100, self.status_monitor, notify_queue)
 
 
 @BLACS_worker
 class FPGADeviceWorker(Worker):
-    
-    def init(self):
-        pass
-        #global fpga_api; import fpga_api  # documentation says to do it like this...
-        #self.interface = fpga_api
 
+    def init(self):
+        self.interface = fpga_api.FPGAInterface()
+        self.fpga_start = self.interface.start
+        self.fpga_stop = self.interface.stop
+        self.fpga_send_pseudoclock = self.interface.send_pseudoclock
+
+        # cache for smart programming
+        self.smart_cache = {'clocks': {}, 'data': {}}
+
+    def program_manual(self, values):
+        """ Program device to output values when not executing a buffered shot, eg. in realtime mode. """
+        # values = {current_front_panel_values}
+        pass
+        # return modified_front_panel_values
+
+    def transition_to_buffered(self, device_name, h5file, initial_values, fresh_program):
+        with h5py.File(h5file, 'r') as hdf5_file:
+            device_group = hdf5_file["devices"][device_name]
+
+            clocks = device_group['clocks']
+            analog_data = device_group['analog_data']
+
+        # value of each output at end of shot
+        final_state = {}
+
+        # send the pseudoclocks
+        for i, output in enumerate(clocks):
+            clock = clocks[output].value
+            # only send if it has changed or fresh program is requested
+            if fresh_program or (clock != self.smart_cache['clocks'].get(output)):
+                self.smart_cache['clocks'][output] = clock
+                # FIXME: remove hardcoded board_number
+                self.fpga_send_pseudoclock(board_number=0, channel_number=i, clock=clock)
+
+            # if there is no entry for this output in the analog data group, it must be a digital out
+            if not analog_data.get(output):
+                # then determine what the final state of the digital out is (initial state + n_toggles mod 2)
+                # FIXME: check this is right - might be off by 1!
+                n_toggles = sum(clock['toggles'])
+                final_state[output] = clock[0]['toggles'] + (n_toggles % 2)
+
+        # send the analog data
+        for i, output in enumerate(analog_data):
+            data = analog_data[output].value
+            # only send if it has changed or fresh program is requested
+            if fresh_program or (data != self.smart_cache['data'].get(output)):
+                final_state[output] = data[-1]
+                self.smart_cache['data'][output] = data
+                # FIXME: remove hardcoded board_number
+                self.fpga_send_pseudoclock(board_number=0, channel_number=i, data=data)
+
+        return final_state
+
+    def transition_to_manual(self):
+        # FIXME: implement
+        return True
+
+    def check_status(self):
+        # FIXME: implement
+        return {'waiting': False}, False
+        """
+        if self.waits_pending:
+            try:
+                self.all_waits_finished.wait(self.h5file, timeout=0)
+                self.waits_pending = False
+            except zprocess.TimeoutError:
+                pass
+        return pb_read_status(), self.waits_pending
+        """

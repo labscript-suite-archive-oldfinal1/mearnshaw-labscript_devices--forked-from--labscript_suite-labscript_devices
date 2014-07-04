@@ -2,6 +2,8 @@
     Requires libftdi.
 """
 
+import struct 
+
 try:
     import ftdi
 except ImportError:
@@ -33,8 +35,7 @@ def error_check(fn):
         if ft_status != FT_OK:
             try:
                 # assume the context is the first argument (...not aware of a counterexample)
-                err_msg = "An FTDI error occurred while calling '{}' with the parameters '{}'".format(fn.__name__,
-                                                                                                      [repr(arg) for arg in args])
+                err_msg = "An FTDI error occurred while calling '{}'".format(fn.__name__)
                 context = args[0]
                 ftdi_err_msg = ftdi.ftdi_get_error_string(context)
                 raise FTDIError("{}: {}".format(err_msg, ftdi_err_msg))
@@ -52,8 +53,11 @@ class FPGAInterface:
     vendor_id = 0x0403
     product_id = 0x6001
     
+    realtime_mode_identifier = 0
     pseudoclock_mode_identifier = 1
     data_mode_identifier = 2
+    parameter_mode_identifier = 3
+    trigger_mode_identifier = 4
 
     def __init__(self):  # device_identifier):
         # create a new context
@@ -65,39 +69,78 @@ class FPGAInterface:
         # enter 245 synchronous FIFO mode with all bits set as outputs (0xFF)
         ftdi.set_bitmode(self.ftdi_c, 0xFF, ftdi.BITMODE_SYNCFF)
 
-    def send_data(self, data):
-        try:
-            n_bytes = len(data)
-        except TypeError:
-            data = str(data)
-            n_bytes = len(data)
+    def send_byte(self, data):
+        byte = struct.pack("B", data)
 
-        ftdi.ftdi_write_data(self.ftdi_c, data, n_bytes)
-        # check return value
+        n_bytes_written = ftdi.ftdi_write_data(self.ftdi_c, byte, 1)
+
+        if n_bytes_written != 1:
+            raise FTDIError("Problem writing to device, check connection.")
+
+        return n_bytes_written
+
+    def send_bytes(self, bytes):
+        """ send a packed byte sequence """
+        for byte in bytes:
+            self.send_byte(bytes)
 
     def send_pseudoclock(self, board_number, channel_number, clock):
         """ Send pseudoclock to a given channel on a given board. """
         # send identifier
-        self.send_data(self.pseudoclock_mode_identifier)
+        self.send_byte(self.pseudoclock_mode_identifier)
 
         # send board number
-        self.send_data(board_number)
+        self.send_byte(board_number)
 
         # send channel number
-        self.send_data(channel_number)
+        self.send_byte(channel_number)
         
         # takes 1 word to send #clocks, and 1 to send toggles
         n_words = 2 * len(clock)  
         # send number of words
-        self.send_data(n_words)
+        self.send_byte(n_words)
 
-        # send clocks and toggles
+        # send clocks and toggles, each is packed into a 4 byte word
         for tick in clock:
-            self.send_data(tick['toggles'])
-            self.send_data(tick['n_clocks'])
+            clocks = struct.pack(">I", tick['clocks'])
+            self.send_bytes(clocks)
+            toggles = struct.pack(">I", tick['toggles'])
+            self.send_bytes(toggles)
 
     def send_analog_data(self, board_number, channel_number, data):
         """ Send analog data to a given channel on a given board. """
-        # data = encode_analog_data(data)
-        pass
+        # send identifier
+        self.send_byte(self.data_mode_identifier)
 
+        # send board number
+        self.send_byte(board_number)
+
+        # send channel number
+        self.send_byte(channel_number)
+        
+        # address and data transmitted in a single word
+        n_words = len(data)
+
+        # send number of words
+        self.send_byte(n_words)
+
+        # send addressed data
+        address = 0  # FIXME: how to deal with/specify addresses?
+        for datum in data:
+            # pack data/address into 2 bytes
+            data = struct.pack(">I", datum)[-2:]
+            address = struct.pack(">I", address)[-2:]
+            self.send_bytes(address)
+            self.send_byte(data)
+
+    def start(self):
+        """ Trigger a shot. """
+        try:
+            self.send_byte(self.trigger_mode_identifier)
+        except FTDIError as err:
+            # supply some extra info
+            raise FTDIError("Error occurred while trying to send trigger: {}".format(err.message))
+
+    def stop(self):
+        """ Stop output of board. """
+        pass
