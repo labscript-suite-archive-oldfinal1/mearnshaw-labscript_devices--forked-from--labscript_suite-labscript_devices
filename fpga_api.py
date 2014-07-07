@@ -2,7 +2,7 @@
     Requires libftdi.
 """
 
-import struct 
+import struct
 
 try:
     import ftdi
@@ -10,17 +10,22 @@ except ImportError:
     import ftdi1 as ftdi
 
 
-def encode_pseudoclock(clock):
-    """ Convert labscript generated pseudoclock into byte encoding expected by FPGA. """
+def int_to_bytes(i, length=None):
+    """ Convert int to byte buffer, optionally padding to a specified length. """
+    bytes = []
+    while i > 0:
+        n = i % 256
+        bytes.insert(0, n)
+        i >>= 8
 
-    pass
+    if length is not None:
+        # add some padding null bytes at start
+        diff = length - len(bytes)
+        bytes[:0] = [0] * diff
 
+    return ''.join(struct.pack('B', x) for x in bytes)
 
-def encode_analog_data(data):
-    """ Convert labscript generated pseudoclock into byte encoding expected by FPGA. """
-    pass
-
-# status code
+# FTDI status codes
 FT_OK = 0
 
 
@@ -52,7 +57,7 @@ ftdi.set_bitmode = error_check(ftdi.ftdi_set_bitmode)
 class FPGAInterface:
     vendor_id = 0x0403
     product_id = 0x6001
-    
+
     realtime_mode_identifier = 0
     pseudoclock_mode_identifier = 1
     data_mode_identifier = 2
@@ -69,74 +74,69 @@ class FPGAInterface:
         # enter 245 synchronous FIFO mode with all bits set as outputs (0xFF)
         ftdi.set_bitmode(self.ftdi_c, 0xFF, ftdi.BITMODE_SYNCFF)
 
-    def send_byte(self, data):
-        byte = struct.pack("B", data)
+    def send_bytes(self, bytes_):
+        n_bytes_written = ftdi.ftdi_write_data(self.ftdi_c, bytes_, len(bytes_))
 
-        n_bytes_written = ftdi.ftdi_write_data(self.ftdi_c, byte, 1)
-
-        if n_bytes_written != 1:
+        if n_bytes_written < len(bytes_):
             raise FTDIError("Problem writing to device, check connection.")
 
         return n_bytes_written
 
-    def send_bytes(self, bytes):
-        """ send a packed byte sequence """
-        for byte in bytes:
-            self.send_byte(bytes)
+    def send_value(self, value, length=None):
+        """ Send value, optionally coercing to a fit specified number of bytes. """
+        bytes_ = int_to_bytes(value, length)
+        return self.send_bytes(bytes_)
 
     def send_pseudoclock(self, board_number, channel_number, clock):
         """ Send pseudoclock to a given channel on a given board. """
-        # send identifier
-        self.send_byte(self.pseudoclock_mode_identifier)
+        # send identifier (1 byte)
+        self.send_value(self.pseudoclock_mode_identifier, 1)
 
-        # send board number
-        self.send_byte(board_number)
+        # send board number (1 byte)
+        self.send_value(board_number, 1)
 
-        # send channel number
-        self.send_byte(channel_number)
-        
+        # send channel number (1 byte)
+        self.send_value(channel_number, 1)
+
         # takes 1 word to send #clocks, and 1 to send toggles
-        n_words = 2 * len(clock)  
-        # send number of words
-        self.send_byte(n_words)
+        n_words = 2 * len(clock)
+        # send number of words (1 byte)
+        self.send_value(n_words, 1)
 
         # send clocks and toggles, each is packed into a 4 byte word
         for tick in clock:
-            clocks = struct.pack(">I", tick['clocks'])
-            self.send_bytes(clocks)
-            toggles = struct.pack(">I", tick['toggles'])
-            self.send_bytes(toggles)
+            self.send_value(tick['n_clocks'], 4)
+            self.send_value(tick['toggles'], 4)
 
     def send_analog_data(self, board_number, channel_number, data):
         """ Send analog data to a given channel on a given board. """
         # send identifier
-        self.send_byte(self.data_mode_identifier)
+        self.send_value(self.data_mode_identifier, 1)
 
         # send board number
-        self.send_byte(board_number)
+        self.send_value(board_number, 1)
 
         # send channel number
-        self.send_byte(channel_number)
-        
+        self.send_value(channel_number, 1)
+
         # address and data transmitted in a single word
         n_words = len(data)
 
         # send number of words
-        self.send_byte(n_words)
+        self.send_value(n_words, 1)
 
         # send addressed data
         address = 0  # FIXME: how to deal with/specify addresses?
         for datum in data:
             # pack data/address into 2 bytes
-            data = struct.pack(">I", datum)[-2:]
-            address = struct.pack(">I", address)[-2:]
-            self.send_bytes(address)
-            self.send_byte(data)
+            self.send_value(address, 2)
+            self.send_value(datum, 2)
+            address += 1  # FIXME: how to deal with/specify addresses?
 
     def start(self):
         """ Trigger a shot. """
         try:
-            self.send_byte(self.trigger_mode_identifier)
+            self.send_value(self.trigger_mode_identifier, 1)
         except FTDIError as err:
             # supply some extra info
             raise FTDIError("Error occurred while trying to send trigger: {}".format(err.message))
