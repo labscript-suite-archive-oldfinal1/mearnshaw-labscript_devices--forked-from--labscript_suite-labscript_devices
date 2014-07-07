@@ -100,7 +100,7 @@ class FPGADevice(PseudoclockDevice):
     description = "FPGA-Device"
     allowed_children = [Pseudoclock]
 
-    def __init__(self, name, usb_port, n_analog=5, n_digital=5):
+    def __init__(self, name, usb_port, n_analog, n_digital):
         # device is triggered by PC, so trigger device is None and this device becomes the master_pseudoclock
         PseudoclockDevice.__init__(self, name)
 
@@ -163,15 +163,6 @@ class FPGADevice(PseudoclockDevice):
             if output is None:
                 raise LabscriptError("OutputDevice '{}' has no Output connected!".format(self.output_devices[i].name))
 
-            # restrict connection names (for BLACS)
-            try:
-                prefix, channel = output.connection.split(' ')
-                if prefix != "analog" and prefix != "digital":
-                    raise ValueError
-                channel = int(channel)
-            except ValueError:
-                raise LabscriptError("{} {} has invalid connection string '{}'. Format must be 'analog|digital #'.".format(output.description,
-                                                                                                                           output.name, str(output.connection)))
             # combine instructions with equal periods
             pseudoclock.clock = reduce_clock_instructions(pseudoclock.clock)  # , self.clock_resolution)
 
@@ -208,15 +199,25 @@ class OutputIntermediateDevice(IntermediateDevice):
         self.output = None
 
     def add_device(self, device):
-        """ Disallow adding multiple devices, only allowed child is a single output. """
+        """ Disallow adding multiple devices, only allowed child is a single output.
+            Also restrict connection names (BLACS code expects specific names). """
 
+        # disallow adding multiple devices
         if self.child_devices:
             raise LabscriptError("Output '{}' is already connected to the OutputIntermediateDevice '{}'. Only one output is allowed.".format(
                 self.child_devices[0].name, self.name))
         else:
+            # allow the connection name to be "analog #" or "digital #" only
+            try:
+                prefix, channel = device.connection.split(' ')
+                if prefix != "analog" and prefix != "digital":
+                    raise ValueError
+                channel = int(channel)
+            except ValueError:
+                raise LabscriptError("{} {} has invalid connection string '{}'. Format must be 'analog|digital #'.".format(device.description,
+                                                                                                                           device.name, str(device.connection)))
             IntermediateDevice.add_device(self, device)
             self.output = device  # store reference to the output
-
 
 
 #########
@@ -234,9 +235,7 @@ class FPGADeviceTab(DeviceTab):
 
     def initialise_GUI(self):
         
-        # placeholder values - how to make them dynamic?
-        self.num_DO = 5
-        self.num_AO = 5
+        self.num_DO, self.num_AO = self.quantify_outputs()
 
         self.base_units = 'Hz'
         # self.base_min
@@ -261,10 +260,50 @@ class FPGADeviceTab(DeviceTab):
 
         self.supports_smart_programming(True)
 
+    def quantify_outputs(self):
+        """ Return number of digital, number of analog outputs attached
+        by inspecting the connection table. """
+
+        device_conn = self.connection_table.find_by_name(self.device_name)
+        
+        num_DO = 0
+        num_AO = 0
+
+        # iterate over the pseudoclock connections and find the type of output ultimately attached to it
+        for pseudoclock_conn in device_conn.child_list.values():
+            clockline_conn = pseudoclock_conn.child_list.values()[0]
+            id_conn = clockline_conn.child_list.values()[0]
+            output_conn = id_conn.child_list.values()[0]
+
+            if output_conn.device_class == "AnalogOut":
+                num_AO += 1
+            elif output_conn.device_class == "DigitalOut":
+                num_DO += 1
+
+        return num_DO, num_AO
+
     def initialise_workers(self):
         self.usb_port = self.settings['connection_table'].find_by_name(self.device_name).BLACS_connection
         self.create_worker("main_worker", FPGADeviceWorker, {'usb_port': self.usb_port})
         self.primary_worker = "main_worker"
+
+    def get_child_from_connection_table(self, parent_device_name, port):
+        """ Return connection object for the output connected to an IntermediateDevice via the port specified. """
+
+        if parent_device_name == self.device_name:
+            device_conn = self.connection_table.find_by_name(self.device_name)
+
+            pseudoclocks_conn = device_conn.child_list  # children of our pseudoclock device are just the pseudoclocks (
+
+            for pseudoclock_conn in pseudoclocks_conn.values():
+                clockline_conn = pseudoclock_conn.child_list.values()[0]  # each pseudoclock has 1 child, a clockline
+                intermediate_device_conn = clockline_conn.child_list.values()[0]  # each clock line has 1 child, an intermediate device
+
+                if intermediate_device_conn.parent_port == port:
+                    return intermediate_device_conn
+        else:
+            # else it's a child of a DDS, so we can use the default behaviour to find the device
+            return DeviceTab.get_child_from_connection_table(self, parent_device_name, port)
 
     @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
     def status_monitor(self, notify_queue=None):
