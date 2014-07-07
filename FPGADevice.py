@@ -1,14 +1,17 @@
 # skeleton for the FPGA device with multiple pseudoclocks each connected to a single output
 
-from labscript_devices import labscript_device  #, BLACS_tab, BLACS_worker, runviewer_parser
+from labscript_devices import labscript_device, BLACS_tab, BLACS_worker, runviewer_parser
 
 from labscript import PseudoclockDevice, Pseudoclock, ClockLine, IntermediateDevice,\
     AnalogOut, DigitalOut, LabscriptError, config
 
+from blacs.tab_base_classes import Worker, define_state, \
+    MODE_MANUAL, MODE_TRANSITION_TO_BUFFERED, MODE_BUFFERED, MODE_TRANSITION_TO_MANUAL
+from blacs.device_base_class import DeviceTab
+
 import numpy as np
 import h5py
 
-from labscript_devices import fpga_api
 
 # Example
 #
@@ -17,14 +20,14 @@ from labscript_devices import fpga_api
 # from labscript_devices.FPGADevice import FPGADevice
 #
 # FPGADevice(name='fpga', usb_port='COM1')
-# AnalogOut('analog0', fpga.outputs, 'ao0')
-# DigitalOut('digi0', fpga.outputs, 'digi1')
+# AnalogOut('analog0', fpga.outputs, 'analog 0')
+# DigitalOut('digi0', fpga.outputs, 'digital 1')
 #
 # start()
 # analog0.ramp(0, duration=3, initial=0, final=1, samplerate=1e4)
 # stop(1)
 
-def reduce_clock_instructions(clock): # FIXME: clock_resolution?
+def reduce_clock_instructions(clock):  # FIXME: clock_resolution?
     """ Combine consecutive instructions with the same period. """
 
     reduced_instructions = []
@@ -100,13 +103,16 @@ class FPGADevice(PseudoclockDevice):
     description = "FPGA-Device"
     allowed_children = [Pseudoclock]
 
-    def __init__(self, name, usb_port, n_analog, n_digital):
+    def __init__(self, name, usb_port, n_analog=None, n_digital=None):
+        """ n_analog: number of analog outputs expected (optional, unlimited if unspecified)
+            n_digital: number of digital outputs expected (optional, unlimited if unspecified)
+        """
         # device is triggered by PC, so trigger device is None and this device becomes the master_pseudoclock
         PseudoclockDevice.__init__(self, name)
 
         self.BLACS_connection = usb_port
 
-        # number of outputs of each type that device should have
+        # number of outputs of each type that device should have, if unspecified set to -1 (allow unlimited)
         self.n_analog = n_analog
         self.n_digital = n_digital
 
@@ -122,7 +128,12 @@ class FPGADevice(PseudoclockDevice):
         """ Return an output device to which an output can be connected. """
         n = len(self.pseudoclocks)  # the number identifying this new output (zero indexed)
 
-        if n == (self.n_digital + self.n_analog):
+        try:
+            max_n = self.n_digital + self.n_analog
+        except TypeError:
+            max_n = -1
+
+        if n == max_n:
             raise LabscriptError("Cannot connect more than {} outputs to the device '{}'".format(n, self.name))
         else:
             pc = Pseudoclock("fpga_pseudoclock{}".format(n), self, "clock_{}".format(n))
@@ -139,11 +150,19 @@ class FPGADevice(PseudoclockDevice):
             return oid
 
     def generate_code(self, hdf5_file):
+        # FIXME: restrict length of clock instructions/data based on hardware limitations
+
         # check that correct number of outputs are attached
         outputs = [output_device.output.__class__ for output_device in self.output_devices]
 
         n_analog = outputs.count(AnalogOut)
         n_digital = outputs.count(DigitalOut)
+
+        # expected number not specified then whatever we have is correct
+        if not self.n_digital:
+            self.n_digital = n_digital
+        if not self.n_analog:
+            self.n_analog = n_analog
 
         if (self.n_analog != n_analog) or (self.n_digital != n_digital):
             raise LabscriptError("FPGADevice '{}' does not have enough outputs attached. "
@@ -223,11 +242,6 @@ class OutputIntermediateDevice(IntermediateDevice):
 #########
 # BLACS #
 #########
-
-from labscript_devices import BLACS_tab, BLACS_worker
-from blacs.tab_base_classes import Worker, define_state, \
-    MODE_MANUAL, MODE_TRANSITION_TO_BUFFERED, MODE_BUFFERED, MODE_TRANSITION_TO_MANUAL
-from blacs.device_base_class import DeviceTab
 
 
 @BLACS_tab
@@ -362,21 +376,40 @@ class FPGADeviceTab(DeviceTab):
 class FPGADeviceWorker(Worker):
 
     def init(self):
-        self.interface = fpga_api.FPGAInterface()
-        self.fpga_start = self.interface.start
-        self.fpga_stop = self.interface.stop
-        self.fpga_send_pseudoclock = self.interface.send_pseudoclock
+        # do imports here otherwwise "they will be imported in both the parent and child
+        # processes and won't be cleanly restarted when the subprocess is restarted."
+        from labscript_devices.fpga_api import FPGAInterface
+
+        self.interface = FPGAInterface()
 
         # cache for smart programming
         self.smart_cache = {'clocks': {}, 'data': {}}
 
+    def check_status(self):
+        # FIXME: implement
+        return {'waiting': False}, False
+        """
+        if self.waits_pending:
+            try:
+                self.all_waits_finished.wait(self.h5file, timeout=0)
+                self.waits_pending = False
+            except zprocess.TimeoutError:
+                pass
+        return pb_read_status(), self.waits_pending
+        """
+
     def program_manual(self, values):
         """ Program device to output values when not executing a buffered shot, eg. in realtime mode. """
+        # FIXME: implement, if required - DeviceTab implementation may be sufficient.
         # values = {current_front_panel_values}
         pass
         # return modified_front_panel_values
 
+    @define_state(MODE_MANUAL, True)
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh_program):
+        """  This function is called whenever the Queue Manager requests the
+        device to move into buffered mode in preparation for executing a buffered sequence. """
+
         with h5py.File(h5file, 'r') as hdf5_file:
             device_group = hdf5_file["devices"][device_name]
 
@@ -393,7 +426,7 @@ class FPGADeviceWorker(Worker):
             if fresh_program or (clock != self.smart_cache['clocks'].get(output)):
                 self.smart_cache['clocks'][output] = clock
                 # FIXME: remove hardcoded board_number
-                self.fpga_send_pseudoclock(board_number=0, channel_number=i, clock=clock)
+                self.interface.send_pseudoclock(board_number=0, channel_number=i, clock=clock)
 
             # if there is no entry for this output in the analog data group, it must be a digital out
             if not analog_data.get(output):
@@ -410,23 +443,41 @@ class FPGADeviceWorker(Worker):
                 final_state[output] = data[-1]
                 self.smart_cache['data'][output] = data
                 # FIXME: remove hardcoded board_number
-                self.fpga_send_pseudoclock(board_number=0, channel_number=i, data=data)
+                self.interface.send_analog_data(board_number=0, channel_number=i, data=data)
 
         return final_state
 
+    @define_state(MODE_BUFFERED, False)
     def transition_to_manual(self):
-        # FIXME: implement
+        """ This function is called after the master pseudoclock reports that the experiment has finished.
+        This function takes no arguments, should place the device back in the correct mode for operation
+        by the front panel of BLACS, and return a Boolean flag indicating the success of this method. """
+        # FIXME: implement, if required - DeviceTab implementation may be sufficient.
         return True
 
-    def check_status(self):
-        # FIXME: implement
-        return {'waiting': False}, False
-        """
-        if self.waits_pending:
-            try:
-                self.all_waits_finished.wait(self.h5file, timeout=0)
-                self.waits_pending = False
-            except zprocess.TimeoutError:
-                pass
-        return pb_read_status(), self.waits_pending
-        """
+    @define_state(MODE_BUFFERED, False)
+    def abort_buffered(self):
+        # FIXME: implement, if required - DeviceTab implementation may be sufficient.
+        # place the device back in manual mode, while in the middle
+        # of an experiment shot
+        # return True if this was all successful, or False otherwise
+        return True
+
+    @define_state(MODE_TRANSITION_TO_BUFFERED, False)
+    def abort_transition_to_buffered(self):
+        # FIXME: implement, if required - DeviceTab implementation may be sufficient.
+        # place the device back in manual mode, after the device has run
+        # transition_to_buffered, but has not been triggered to
+        # begin the experiment shot.
+        # return True if this was all successful, or False otherwise
+        return True
+
+    def shutdown(self):
+        # This should put the device in safe state, for example closing any open communication connections with the device.
+        # The function should not return any value (the return value is ignored)
+        pass
+
+
+@runviewer_parser
+class FPGARunViewerParser:
+    pass
