@@ -274,7 +274,7 @@ class FPGADeviceTab(DeviceTab):
         analog_properties = {}
         for i in range(self.num_AO):
             analog_properties["analog %s" % i] = {'base_unit': self.base_units,
-                                                  'min': 0, 'max': 10, 'step': 1, 'decimals': 1}
+                                                  'min': 0.0, 'max': 10.0, 'step': 0.1, 'decimals': 3}
 
         self.create_analog_outputs(analog_properties)
         self.create_digital_outputs(digital_properties)
@@ -431,7 +431,7 @@ class FPGADeviceWorker(Worker):
                 # send_realtime_value returns the actual value the board is now outputting
                 # so we can update the front panel to accurately reflect this
                 # FIXME: remove hardcoded board number and range values
-                new_value = self.interface.send_realtime_value(0, channel_number, value, 0, 5, output_type)
+                new_value = self.interface.send_realtime_value(0, channel_number, value, 0, 10, output_type)
                 modified_values[output_name] = new_value
                 self.smart_cache['output_values'][output_name] = new_value
 

@@ -32,10 +32,12 @@ def quantize_analog_value(value, range_min, range_max):
     are possible with our LTC1592 DACs).
 
     Returns value to be packed in the 16-bit data word to specify
-    the desired output given the currently programmed range. """
+    the desired output given the currently programmed range, and
+    the quantized value it represents. """
     step = (range_max - range_min) / (2.0**16 - 1)
-    value = int(round((value - range_min) / step))
-    return value
+    DAC_data = int(round((value - range_min) / step))
+    quantized = DAC_data * step
+    return quantized, DAC_data
 
 
 class FTDIError(Exception):
@@ -90,7 +92,7 @@ class FPGAInterface:
 
         # create a new context
         self.c = ftdi.new()
-        
+
         # find all the attached devices with the given VID:PID
         return_code, devices = ftdi.usb_find_all(self.c, vendor_id, product_id)
 
@@ -106,7 +108,7 @@ class FPGAInterface:
                 devices.next()
             except TypeError:
                 break
-                
+
         # if there is more than one device found then warn about it
         # later we should perhaps allow the user to choose the device in BLACS, or optionally specify a serial
         if len(device_list) > 1:
@@ -120,7 +122,7 @@ class FPGAInterface:
         # enter 245 synchronous FIFO mode with all bits set as outputs (0xFF)
         # assumes external EEPROM is set to 245 FIFO mode
         ftdi.set_bitmode(self.c, 0xFF, ftdi.BITMODE_SYNCFF)
-        
+
     # FIXME: make this class a proper context manager instead?
     def close(self):
         # close device and free context
@@ -213,8 +215,8 @@ class FPGAInterface:
         self.send_value(channel_number, n_bytes=1)
 
         if output_type == "analog":
-            value = quantize_analog_value(value, range_min, range_max)
-            self.send_value(value, n_bytes=2)
+            value, DAC_data = quantize_analog_value(value, range_min, range_max)
+            self.send_value(DAC_data, n_bytes=2)
         elif output_type == "digital":
             # value is bool for digital outs but since bool is a subclass of int, send_value works.
             self.send_value(value, n_bytes=1)
