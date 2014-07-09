@@ -736,13 +736,13 @@ class PulseblasterWorker(Worker):
                 
                 pb_select_dds(i)
                 # Only reprogram each thing if there's been a change:
-                if fresh or len(amps) != len(self.smart_cache['amps%d'%i]) or (amps != self.smart_cache['amps%d'%i]).any():   
+                if fresh or len(amps) != len(self.smart_cache['amps%d'%i]) or np.any(amps != self.smart_cache['amps%d'%i]):   
                     self.smart_cache['amps%d'%i] = amps
                     program_amp_regs(*amps)
-                if fresh or len(freqs) != len(self.smart_cache['freqs%d'%i]) or (freqs != self.smart_cache['freqs%d'%i]).any():
+                if fresh or len(freqs) != len(self.smart_cache['freqs%d'%i]) or np.any(freqs != self.smart_cache['freqs%d'%i])):
                     self.smart_cache['freqs%d'%i] = freqs
                     program_freq_regs(*freqs)
-                if fresh or len(phases) != len(self.smart_cache['phases%d'%i]) or (phases != self.smart_cache['phases%d'%i]).any():      
+                if fresh or len(phases) != len(self.smart_cache['phases%d'%i]) or np.any(phases != self.smart_cache['phases%d'%i]):      
                     self.smart_cache['phases%d'%i] = phases
                     program_phase_regs(*phases)
                 
@@ -764,7 +764,7 @@ class PulseblasterWorker(Worker):
 
             if fresh or (self.smart_cache['initial_values'] != initial_values) or \
             (len(self.smart_cache['pulse_program']) != len(pulse_program)) or \
-            (self.smart_cache['pulse_program'] != pulse_program).any() or \
+            np.any(self.smart_cache['pulse_program'] != pulse_program) or \
             not self.smart_cache['ready_to_go']:
             
                 self.smart_cache['ready_to_go'] = True
@@ -794,7 +794,7 @@ class PulseblasterWorker(Worker):
                 pb_inst_dds2(0,0,0,initial_values['dds 0']['gate'],0,0,0,0,initial_values['dds 1']['gate'],0,initial_flags, CONTINUE, 0, 100)
                 # Now the rest of the program:
                 if fresh or len(self.smart_cache['pulse_program']) != len(pulse_program) or \
-                (self.smart_cache['pulse_program'] != pulse_program).any():
+                        np.any(self.smart_cache['pulse_program'] != pulse_program):
                     self.smart_cache['pulse_program'] = pulse_program
                     for args in pulse_program:
                         pb_inst_dds2(*args)
