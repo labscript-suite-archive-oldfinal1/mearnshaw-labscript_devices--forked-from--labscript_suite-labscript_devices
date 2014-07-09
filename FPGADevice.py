@@ -183,6 +183,7 @@ class FPGADevice(PseudoclockDevice):
         for i, pseudoclock in enumerate(self.pseudoclocks):
 
             output = self.output_devices[i].output
+            output_connection = output.connection
 
             if output is None:
                 raise LabscriptError("OutputDevice '{}' has no Output connected!".format(self.output_devices[i].name))
@@ -195,20 +196,20 @@ class FPGADevice(PseudoclockDevice):
 
             clock = np.array(ct_clock, dtype=[('n_clocks', int), ('toggles', int)])
 
-            clock_group.create_dataset(output.name,
+            clock_group.create_dataset(output_connection,
                                        data=clock,
                                        compression=config.compression)
 
             # we only need to save analog data, digital outputs are
             # constructed from the clocks/toggles clocking signal
             if isinstance(output, AnalogOut):
-                analog_data_group.create_dataset(output.name,
+                analog_data_group.create_dataset(output_connection,
                                                  data=output.raw_output,
                                                  compression=config.compression)
                 # also save the limits of the output
                 try:
                     limits = np.array(output.limits, dtype=[('range_min', float), ('range_max', float)])
-                    analog_limits_group.create_dataset(output.name,
+                    analog_limits_group.create_dataset(output_connection,
                                                        data=limits,
                                                        compression=config.compression)
                 except TypeError:
@@ -449,6 +450,8 @@ class FPGADeviceWorker(Worker):
         with h5py.File(h5file, 'r') as hdf5_file:
             device_group = hdf5_file["devices"][device_name]
 
+            # FIXME: might be better to make local copies of these so h5 file
+            # can be closed sooner (in theory could speed up experiment cycle)
             clocks = device_group['clocks']
             analog_data = device_group['analog_data']
             limits = device_group['analog_limits']
@@ -476,7 +479,7 @@ class FPGADeviceWorker(Worker):
             for i, output in enumerate(analog_data):
                 data = analog_data[output].value
                 # only send if it has changed or fresh program is requested
-                if fresh_program or np.any(data != self.smart_cache['data'].get(output))):
+                if fresh_program or np.any(data != self.smart_cache['data'].get(output)):
                     final_state[output] = data[-1]
                     self.smart_cache['data'][output] = data
                     try:
