@@ -175,6 +175,11 @@ class FPGADevice(PseudoclockDevice):
         # group in which to save instructions for this device
         device_group = hdf5_file.create_group("/devices/{}".format(self.name))
 
+        # create subgroups for the clocks, analog data, and analog limits
+        clock_group = device_group.create_group("clocks")
+        analog_data_group = device_group.create_group("analog_data")
+        analog_limits_group = device_group.create_group("analog_limits")
+
         for i, pseudoclock in enumerate(self.pseudoclocks):
 
             output = self.output_devices[i].output
@@ -190,22 +195,22 @@ class FPGADevice(PseudoclockDevice):
 
             clock = np.array(ct_clock, dtype=[('n_clocks', int), ('toggles', int)])
 
-            device_group.create_dataset("clocks/{}".format(output.name),
-                                        data=clock,
-                                        compression=config.compression)
+            clock_group.create_dataset(output.name,
+                                       data=clock,
+                                       compression=config.compression)
 
             # we only need to save analog data, digital outputs are
             # constructed from the clocks/toggles clocking signal
             if isinstance(output, AnalogOut):
-                device_group.create_dataset("analog_data/{}".format(output.name),
-                                            data=output.raw_output,
-                                            compression=config.compression)
+                analog_data_group.create_dataset(output.name,
+                                                 data=output.raw_output,
+                                                 compression=config.compression)
                 # also save the limits of the output
                 try:
                     limits = np.array(output.limits, dtype=[('range_min', float), ('range_max', float)])
-                    device_group.create_dataset("analog_limits/{}".format(output.name),
-                                                data=limits,
-                                                compression=config.compression)
+                    analog_limits_group.create_dataset(output.name,
+                                                       data=limits,
+                                                       compression=config.compression)
                 except TypeError:
                     # no limits specified
                     pass
@@ -455,7 +460,7 @@ class FPGADeviceWorker(Worker):
             for i, output in enumerate(clocks):
                 clock = clocks[output].value
                 # only send if it has changed or fresh program is requested
-                if fresh_program or (clock != self.smart_cache['clocks'].get(output)).any():
+                if fresh_program or np.any(clock != self.smart_cache['clocks'].get(output)):
                     self.smart_cache['clocks'][output] = clock
                     # FIXME: remove hardcoded board_number
                     self.interface.send_pseudoclock(board_number=0, channel_number=i, clock=clock)
@@ -471,7 +476,7 @@ class FPGADeviceWorker(Worker):
             for i, output in enumerate(analog_data):
                 data = analog_data[output].value
                 # only send if it has changed or fresh program is requested
-                if fresh_program or (data != self.smart_cache['data'].get(output)).any():
+                if fresh_program or np.any(data != self.smart_cache['data'].get(output))):
                     final_state[output] = data[-1]
                     self.smart_cache['data'][output] = data
                     try:
@@ -513,6 +518,28 @@ class FPGADeviceWorker(Worker):
         pass
 
 
+"""
 @runviewer_parser
 class FPGARunViewerParser:
-    pass
+
+    def __init__(self, path, device):
+        self.path = path
+        self.name = device.name
+        self.device = device
+
+    def get_traces(self, add_trace, clock=None):
+        if clock is not None:
+            times, clock_value = clock[0], clock[1]
+            clock_indices = np.where((clock_value[1:] - clock_value[:-1]) == 1)[0] + 1
+            # If initial clock value is 1, then this counts as a rising edge (clock should be 0 before experiment)
+            # but this is not picked up by the above code. So we insert it!
+            if clock_value[0] == 1:
+                clock_indices = np.insert(clock_indices, 0, 0)
+            clock_ticks = times[clock_indices]
+
+        with h5py.File(self.path, 'r') as f:
+            clocks = f['devices'][self.name]['clocks'][:]
+
+        for output in clocks:
+            pass
+"""

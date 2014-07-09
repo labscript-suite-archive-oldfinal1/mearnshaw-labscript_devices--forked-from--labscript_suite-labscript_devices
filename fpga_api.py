@@ -86,6 +86,7 @@ class FPGAInterface:
     parameter_mode_identifier = 3
     trigger_mode_identifier = 4
 
+    # FIXME: change to the correct VID:PID for FT232H
     def __init__(self, vendor_id=0x0403, product_id=0x6001):
         self.vendor_id = vendor_id
         self.product_id = product_id
@@ -103,7 +104,6 @@ class FPGAInterface:
                 device_list.append(devices.dev)
             except AttributeError:
                 raise FTDIError("No devices found, check connections.")
-
             try:
                 devices.next()
             except TypeError:
@@ -192,11 +192,12 @@ class FPGAInterface:
         # send addressed data
         address = 0  # FIXME: how to deal with/specify addresses?
         for datum in data:
-            # pack data into 2 bytes
+            # pack address into 2 bytes
             self.send_value(address, n_bytes=2)
 
             # pack quantized value into 2 bytes
-            self.send_value(quantize_analog_value(datum), n_bytes=2)
+            quantized_value, DAC_data = quantize_analog_value(datum, range_min, range_max)
+            self.send_value(DAC_data, n_bytes=2)
             address += 1  # FIXME: how to deal with/specify addresses?
 
     def send_realtime_value(self, board_number, channel_number, value, range_min, range_max, output_type):
