@@ -19,7 +19,7 @@ import h5py
 # from labscript import *
 # from labscript_devices.FPGADevice import FPGADevice
 #
-# FPGADevice(name='fpga', usb_port='COM1')
+# FPGADevice(name='fpga')
 # AnalogOut('analog0', fpga.outputs, 'analog 0')
 # DigitalOut('digi0', fpga.outputs, 'digital 1')
 #
@@ -103,16 +103,16 @@ class FPGADevice(PseudoclockDevice):
     description = "FPGA-Device"
     allowed_children = [Pseudoclock]
 
-    def __init__(self, name, usb_port, n_analog=None, n_digital=None):
+    def __init__(self, name, n_analog=None, n_digital=None):
         """ n_analog: number of analog outputs expected (optional, unlimited if unspecified)
             n_digital: number of digital outputs expected (optional, unlimited if unspecified)
         """
         # device is triggered by PC, so trigger device is None and this device becomes the master_pseudoclock
         PseudoclockDevice.__init__(self, name)
 
-        self.BLACS_connection = usb_port
+        self.BLACS_connection = None  # FIXME: make this something useful?
 
-        # number of outputs of each type that device should have, if unspecified set to -1 (allow unlimited)
+        # number of outputs of each type that device should have, if specified
         self.n_analog = n_analog
         self.n_digital = n_digital
 
@@ -131,7 +131,7 @@ class FPGADevice(PseudoclockDevice):
         try:
             max_n = self.n_digital + self.n_analog
         except TypeError:
-            max_n = -1
+            max_n = None  # if neither specified
 
         if n == max_n:
             raise LabscriptError("Cannot connect more than {} outputs to the device '{}'".format(n, self.name))
@@ -200,6 +200,15 @@ class FPGADevice(PseudoclockDevice):
                 device_group.create_dataset("analog_data/{}".format(output.name),
                                             data=output.raw_output,
                                             compression=config.compression)
+                # also save the limits of the output
+                try:
+                    limits = np.array(output.limits, dtype=[('range_min', float), ('range_max', float)])
+                    device_group.create_dataset("analog_limits/{}".format(output.name),
+                                                data=limits,
+                                                compression=config.compression)
+                except TypeError:
+                    # no limits specified
+                    pass
 
             # do we need this?
             device_group.attrs['stop_time'] = self.stop_time
@@ -273,7 +282,7 @@ class FPGADeviceTab(DeviceTab):
         self.auto_place_widgets(AO_widgets, DO_widgets)
 
         self.supports_smart_programming(True)
-
+    
     def quantify_outputs(self):
         """ Return number of digital, number of analog outputs attached
         by inspecting the connection table. """
@@ -297,8 +306,9 @@ class FPGADeviceTab(DeviceTab):
         return num_DO, num_AO
 
     def initialise_workers(self):
-        self.usb_port = self.settings['connection_table'].find_by_name(self.device_name).BLACS_connection
-        self.create_worker("main_worker", FPGADeviceWorker, {'usb_port': self.usb_port})
+        initial_values = self.get_front_panel_values()
+        # pass initial front panel values to worker for manual programming cache
+        self.create_worker("main_worker", FPGADeviceWorker, {'initial_values': initial_values})
         self.primary_worker = "main_worker"
 
     def get_child_from_connection_table(self, parent_device_name, port):
@@ -345,20 +355,19 @@ class FPGADeviceTab(DeviceTab):
                 # self.status_widgets[name+'_no'].show()
                 # self.status_widgets[name+'_yes'].hide()
         
- 
     @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
     def start(self, widget=None):
-        yield(self.queue_work(self.primary_worker, 'fpga_start'))
+        yield(self.queue_work(self.primary_worker, 'start'))
         self.status_monitor()
 
     @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
     def stop(self, widget=None):
-        yield(self.queue_work(self.primary_worker, 'fpga_stop'))
+        yield(self.queue_work(self.primary_worker, 'stop'))
         self.status_monitor()
 
     @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
     def reset(self, widget=None):
-        yield(self.queue_work(self.primary_worker, 'fpga_reset'))
+        yield(self.queue_work(self.primary_worker, 'reset'))
         self.status_monitor()
 
     @define_state(MODE_BUFFERED, True)
@@ -382,12 +391,19 @@ class FPGADeviceWorker(Worker):
 
         self.interface = FPGAInterface()
 
+        # define these aliases so that the DeviceTab class can see them
+        self.start = self.interface.start
+        self.stop = self.interface.stop
+        self.reset = self.interface.reset
+
         # cache for smart programming
-        self.smart_cache = {'clocks': {}, 'data': {}}
+        # initial_values attr is created by the DeviceTab initialise_workers method
+        # and reflects the initial state of the front panel values for manual_program to inspect
+        self.smart_cache = {'clocks': {}, 'data': {}, 'output_values': self.initial_values}
 
     def check_status(self):
         # FIXME: implement
-        return {'waiting': False}, False
+        return {'waiting': True}, False
         """
         if self.waits_pending:
             try:
@@ -399,13 +415,28 @@ class FPGADeviceWorker(Worker):
         """
 
     def program_manual(self, values):
-        """ Program device to output values when not executing a buffered shot, eg. in realtime mode. """
-        # FIXME: implement, if required - DeviceTab implementation may be sufficient.
-        # values = {current_front_panel_values}
-        pass
-        # return modified_front_panel_values
+        """ Program device to output values when not executing a buffered shot, ie. realtime mode. """
+        
+        modified_values = {}
 
-    @define_state(MODE_MANUAL, True)
+        for output_name in values:
+            value = values[output_name]
+
+            # only update output if it has changed
+            if value != self.smart_cache['output_values'].get(output_name):
+                output_type, channel_number = output_name.split()
+                channel_number = int(channel_number)
+
+                # the value sent to the board may be coerced/quantized from the one requested
+                # send_realtime_value returns the actual value the board is now outputting
+                # so we can update the front panel to accurately reflect this
+                # FIXME: remove hardcoded board number and range values
+                new_value = self.interface.send_realtime_value(0, channel_number, value, 0, 5, output_type)
+                modified_values[output_name] = new_value
+                self.smart_cache['output_values'][output_name] = new_value
+
+        return modified_values
+
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh_program):
         """  This function is called whenever the Queue Manager requests the
         device to move into buffered mode in preparation for executing a buffered sequence. """
@@ -415,39 +446,45 @@ class FPGADeviceWorker(Worker):
 
             clocks = device_group['clocks']
             analog_data = device_group['analog_data']
+            limits = device_group['analog_limits']
 
-        # value of each output at end of shot
-        final_state = {}
+            # value of each output at end of shot
+            final_state = {}
 
-        # send the pseudoclocks
-        for i, output in enumerate(clocks):
-            clock = clocks[output].value
-            # only send if it has changed or fresh program is requested
-            if fresh_program or (clock != self.smart_cache['clocks'].get(output)):
-                self.smart_cache['clocks'][output] = clock
-                # FIXME: remove hardcoded board_number
-                self.interface.send_pseudoclock(board_number=0, channel_number=i, clock=clock)
+            # send the pseudoclocks
+            for i, output in enumerate(clocks):
+                clock = clocks[output].value
+                # only send if it has changed or fresh program is requested
+                if fresh_program or (clock != self.smart_cache['clocks'].get(output)).any():
+                    self.smart_cache['clocks'][output] = clock
+                    # FIXME: remove hardcoded board_number
+                    self.interface.send_pseudoclock(board_number=0, channel_number=i, clock=clock)
 
-            # if there is no entry for this output in the analog data group, it must be a digital out
-            if not analog_data.get(output):
-                # then determine what the final state of the digital out is (initial state + n_toggles mod 2)
-                # FIXME: check this is right - might be off by 1!
-                n_toggles = sum(clock['toggles'])
-                final_state[output] = clock[0]['toggles'] + (n_toggles % 2)
+                # if there is no entry for this output in the analog data group, it must be a digital out
+                if not analog_data.get(output):
+                    # then determine what the final state of the digital out is (initial state + n_toggles mod 2)
+                    # FIXME: check this is right - might be off by 1!
+                    n_toggles = sum(clock['toggles'])
+                    final_state[output] = clock[0]['toggles'] + (n_toggles % 2)
 
-        # send the analog data
-        for i, output in enumerate(analog_data):
-            data = analog_data[output].value
-            # only send if it has changed or fresh program is requested
-            if fresh_program or (data != self.smart_cache['data'].get(output)):
-                final_state[output] = data[-1]
-                self.smart_cache['data'][output] = data
-                # FIXME: remove hardcoded board_number
-                self.interface.send_analog_data(board_number=0, channel_number=i, data=data)
+            # send the analog data
+            for i, output in enumerate(analog_data):
+                data = analog_data[output].value
+                # only send if it has changed or fresh program is requested
+                if fresh_program or (data != self.smart_cache['data'].get(output)).any():
+                    final_state[output] = data[-1]
+                    self.smart_cache['data'][output] = data
+                    try:
+                        range_min, range_max = limits[output].value
+                    except KeyError:
+                        # FIXME: what should the default range be?
+                        range_min, range_max = 0, 5
+                    # FIXME: remove hardcoded board_number
+                    self.interface.send_analog_data(board_number=0, channel_number=i,
+                                                    range_min=range_min, range_max=range_max, data=data)
 
         return final_state
 
-    @define_state(MODE_BUFFERED, False)
     def transition_to_manual(self):
         """ This function is called after the master pseudoclock reports that the experiment has finished.
         This function takes no arguments, should place the device back in the correct mode for operation
@@ -455,7 +492,6 @@ class FPGADeviceWorker(Worker):
         # FIXME: implement, if required - DeviceTab implementation may be sufficient.
         return True
 
-    @define_state(MODE_BUFFERED, False)
     def abort_buffered(self):
         # FIXME: implement, if required - DeviceTab implementation may be sufficient.
         # place the device back in manual mode, while in the middle
@@ -463,7 +499,6 @@ class FPGADeviceWorker(Worker):
         # return True if this was all successful, or False otherwise
         return True
 
-    @define_state(MODE_TRANSITION_TO_BUFFERED, False)
     def abort_transition_to_buffered(self):
         # FIXME: implement, if required - DeviceTab implementation may be sufficient.
         # place the device back in manual mode, after the device has run
