@@ -263,8 +263,6 @@ class OutputIntermediateDevice(IntermediateDevice):
 class FPGADeviceTab(DeviceTab):
 
     def initialise_GUI(self):
-        
-        self.num_DO, self.num_AO = self.quantify_outputs()
 
         self.base_units = 'Hz'
         # self.base_min
@@ -272,15 +270,19 @@ class FPGADeviceTab(DeviceTab):
         # self.base_step
         # self.base_decimals
 
+        output_names = self.get_output_port_names()
         digital_properties = {}
-        for i in range(self.num_DO):
-            digital_properties["digital %s" % i] = {}
-        
-        # properties['base_unit'], properties['min'], properties['max'], properties['step'], properties['decimals']
         analog_properties = {}
-        for i in range(self.num_AO):
-            analog_properties["analog %s" % i] = {'base_unit': self.base_units,
-                                                  'min': 0.0, 'max': 10.0, 'step': 0.1, 'decimals': 3}
+
+        # properties['base_unit'], properties['min'], properties['max'], properties['step'], properties['decimals']
+        for name in output_names:
+            # the name format assumed here is enforced by add_device method of our IntermediateDevice
+            output_type, num = name.split()
+            if output_type == "analog":
+                analog_properties[name] = {'base_unit': self.base_units,
+                                           'min': 0.0, 'max': 10.0, 'step': 0.1, 'decimals': 3}
+            elif output_type == "digital":
+                digital_properties[name] = {}
 
         self.create_analog_outputs(analog_properties)
         self.create_digital_outputs(digital_properties)
@@ -288,28 +290,22 @@ class FPGADeviceTab(DeviceTab):
         self.auto_place_widgets(AO_widgets, DO_widgets)
 
         self.supports_smart_programming(True)
-    
-    def quantify_outputs(self):
-        """ Return number of digital, number of analog outputs attached
-        by inspecting the connection table. """
 
+    def get_output_port_names(self):
+        """ Return list of connection names of the outputs attached, by inspecting the connection table. """
+
+        output_names = []
         device_conn = self.connection_table.find_by_name(self.device_name)
-        
-        num_DO = 0
-        num_AO = 0
-
+ 
         # iterate over the pseudoclock connections and find the type of output ultimately attached to it
         for pseudoclock_conn in device_conn.child_list.values():
             clockline_conn = pseudoclock_conn.child_list.values()[0]
             id_conn = clockline_conn.child_list.values()[0]
             output_conn = id_conn.child_list.values()[0]
 
-            if output_conn.device_class == "AnalogOut":
-                num_AO += 1
-            elif output_conn.device_class == "DigitalOut":
-                num_DO += 1
+            output_names.append(output_conn.parent_port)
 
-        return num_DO, num_AO
+        return output_names
 
     def initialise_workers(self):
         initial_values = self.get_front_panel_values()
