@@ -19,8 +19,9 @@ except ImportError:
     for member in ftdi_members:
         name, fn = member
         new_name = name.replace("ftdi_", "")
-        vars(ftdi)[new_name] = fn
-        del vars(ftdi)[name]
+        if new_name != name:
+            vars(ftdi)[new_name] = fn
+            del vars(ftdi)[name]
 
 
 def value_to_bytes(i, length=None):
@@ -110,36 +111,12 @@ class FPGAInterface:
         # create a new context
         self.c = ftdi.new()
 
-        # find all the attached devices with the given VID:PID
-        return_code, devices = ftdi.usb_find_all(self.c, vendor_id, product_id)
-
-        # get a python list of the discovered devices
-        device_list = []
-        while True:
-            try:
-                device_list.append(devices.dev)
-            except AttributeError:
-                raise FTDIError("No devices found, check connections.")
-            try:
-                devices.next()
-            except TypeError:
-                break
-
-        # if there is more than one device found then warn about it
-        # later we should perhaps allow the user to choose the device in BLACS, or optionally specify a serial
-        if len(device_list) > 1:
-            return_code, manufacturer, description, serial = ftdi.usb_get_strings(self.c, device_list[0])
-            logging.warning("Multiple devices found with vendor id: {}, product id: {}. "
-                            "Opening device with serial number: {}".format(vendor_id, product_id, serial))
-
         # open first device with the supplied VID:PID
-        ftdi.usb_open_dev(self.c, device_list[0])
-        #ftdi.usb_open(self.c, 0x0403, 0x6014)
+        ftdi.usb_open(self.c, self.vendor_id, self.product_id)
 
-        #ftdi.set_bitmode(self.c, 0xFF, ftdi.BITMODE_SYNCFF)
-        self.init_chip()
+        self.init_chip(bitmode=ftdi.BITMODE_SYNCFF)
 
-    def init_chip(self, bitmode=ftdi.BITMODE_SYNCFF):
+    def init_chip(self, bitmode):
         # enter 245 synchronous FIFO mode with all bits set as outputs (0xFF)
         # assumes external EEPROM is set to 245 FIFO mode
         ftdi.set_latency_timer(self.c, 2)
