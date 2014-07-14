@@ -103,7 +103,6 @@ class FPGAInterface:
     parameter_mode_identifier = 3
     trigger_mode_identifier = 4
 
-    # FIXME: change to the correct VID:PID for FT232H
     def __init__(self, vendor_id=0x0403, product_id=0x6014):  # product_id=0x6001):
         self.vendor_id = vendor_id
         self.product_id = product_id
@@ -115,6 +114,10 @@ class FPGAInterface:
         ftdi.usb_open(self.c, self.vendor_id, self.product_id)
 
         self.init_chip(bitmode=ftdi.BITMODE_SYNCFF)
+
+        # more efficient to send as much data as possible in a single write,
+        # see FTDI Technical Note TN_103 for more info, hence write_buffer
+        self.write_buffer = []
 
     def init_chip(self, bitmode):
         # enter 245 synchronous FIFO mode with all bits set as outputs (0xFF)
@@ -130,11 +133,9 @@ class FPGAInterface:
         ftdi.usb_close(self.c)
         ftdi.free(self.c)
 
-    """
     def __del__(self):
         # close device and free context when interface destroyed
         self.close()
-    """
 
     def send_bytes(self, bytes_):
         """ write a sequence of byte(s) to device. """
@@ -147,10 +148,20 @@ class FPGAInterface:
 
         return n_bytes_written
 
-    def send_value(self, value, n_bytes=None):
-        """ Send value, optionally coercing to a fit specified number of bytes. """
+    def send_buffer(self):
+        """ send whatever is in the write_buffer to the device. """
+        byte_sequence = ''.join(self.write_buffer)
+        self.write_buffer = []  # clear the buffer
+        return self.send_bytes(byte_sequence)
+
+    def send_value(self, value, n_bytes=None, buffered=True):
+        """ Send value, optionally coercing to a fit specified number of bytes.
+            If buffered (default True) then value will be not be written until send_buffer is called. """
         bytes_ = value_to_bytes(value, length=n_bytes)
-        return self.send_bytes(bytes_)
+        if buffered:
+            self.write_buffer.append(bytes_)
+        else:
+            return self.send_bytes(bytes_)
 
     def send_pseudoclock(self, board_number, channel_number, clock):
         """ Send pseudoclock to a given channel on a given board. """
@@ -172,6 +183,9 @@ class FPGAInterface:
         for tick in clock:
             self.send_value(tick['n_clocks'], n_bytes=4)
             self.send_value(tick['toggles'], n_bytes=4)
+
+        # submit bufferred values
+        self.send_buffer()
 
     def send_analog_data(self, board_number, channel_number, range_min, range_max, data):
         """ Send analog data to a given channel on a given board.
@@ -204,6 +218,9 @@ class FPGAInterface:
             self.send_value(DAC_data, n_bytes=2)
             address += 1  # FIXME: how to deal with/specify addresses?
 
+        self.send_buffer()
+
+
     def send_realtime_value(self, board_number, channel_number, value, range_min, range_max, output_type):
         """ Send value to an output in real-time.
             output_type is either 'analog' or 'digital'.
@@ -227,6 +244,7 @@ class FPGAInterface:
             self.send_value(value, n_bytes=1)
         # error or log warning if unknown output_type?
 
+        self.send_buffer()
         # return the value sent to the board
         return value
 
@@ -246,10 +264,13 @@ class FPGAInterface:
         # send the parameter
         self.send_value(value, n_bytes=1)
 
+        self.send_buffer()
+
     def start(self):
         """ Trigger a shot. """
         try:
             self.send_value(self.trigger_mode_identifier, n_bytes=1)
+            self.send_buffer()
         except FTDIError as err:
             # supply some extra info
             raise FTDIError("Error occurred while trying to send trigger: {}".format(err.message))
