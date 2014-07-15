@@ -8,10 +8,17 @@ from labscript import PseudoclockDevice, Pseudoclock, ClockLine, IntermediateDev
 from blacs.tab_base_classes import Worker, define_state, \
     MODE_MANUAL, MODE_TRANSITION_TO_BUFFERED, MODE_BUFFERED, MODE_TRANSITION_TO_MANUAL
 from blacs.device_base_class import DeviceTab
+from blacs.connections import ConnectionTable
+
+from PySide.QtUiTools import QUiLoader
+from PySide.QtCore import Qt, Slot
+from PySide.QtGui import QHBoxLayout, QWidget, QComboBox, QLabel, QVBoxLayout, QGroupBox
+from labscript_utils.qtwidgets.toolpalette import ToolPaletteGroup
 
 import numpy as np
 import h5py
 
+import os
 
 # Example
 #
@@ -26,6 +33,8 @@ import h5py
 # start()
 # analog0.ramp(0, duration=3, initial=0, final=1, samplerate=1e4)
 # stop(1)
+
+# FIXME: fix residual clock instruction issue
 
 def reduce_clock_instructions(clock):  # FIXME: clock_resolution?
     """ Combine consecutive instructions with the same period. """
@@ -80,17 +89,59 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
             n_clocks = int(tick['step'] * clock_limit) - 1
             ct_clock.append((n_clocks, initial_state))
             tick['reps'] -= 1  # have essentially dealt with 1 rep above
-        
+
             # if no more reps then we are done with this instruction
             if tick['reps'] == 0:
                 continue
 
-        #period = int(round(tick['step'] / clock_resolution) * clock_resolution)
+        # period = int(round(tick['step'] / clock_resolution) * clock_resolution)
         toggles = tick['reps']
         n_clocks = int(tick['step'] * clock_limit) - 1
         ct_clock.append((n_clocks, toggles))
 
     return ct_clock
+
+
+def expand_clock(clock, clock_limit, stop_time):
+    """ given a clocks/toggles clocking signal, return
+        a list of times at which the clock ticks. """
+    times = []
+
+    for i, tick in enumerate(clock):
+        n_clocks, toggles = tick
+
+        # first instruction is special, toggles gives initial state,
+        # n_clocks gives number of clocks to hold it for
+        if i == 0:
+            times.append(n_clocks / clock_limit)
+        else:
+            for i in range(toggles):
+                new_time = times[-1] + (n_clocks / clock_limit)
+                # ensure we don't exceed the stop time
+                # may occur due to "residual" instructions
+                if new_time > stop_time:
+                    break
+                else:
+                    times.append(new_time)
+
+    return times
+
+
+def get_output_port_names(connection_table, device_name):
+    """ Return list of connection names of the outputs attached, by inspecting the connection table. """
+
+    output_names = []
+    device_conn = connection_table.find_by_name(device_name)
+
+    # iterate over the pseudoclock connections and find the type of output ultimately attached to it
+    for pseudoclock_conn in device_conn.child_list.values():
+        clockline_conn = pseudoclock_conn.child_list.values()[0]
+        id_conn = clockline_conn.child_list.values()[0]
+        output_conn = id_conn.child_list.values()[0]
+
+        output_names.append(output_conn.parent_port)
+
+    return output_names
 
 
 @labscript_device
@@ -141,7 +192,7 @@ class FPGADevice(PseudoclockDevice):
 
             # Create the internal direct output clock_line
             cl = ClockLine("fpga_output{}_clock_line".format(n), pc, "fpga_internal{}".format(n))
-            # do we really need to store the list of clocklines?
+            # FIXME: do we really need to store the list of clocklines?
             self.clocklines.append(cl)
 
             # Create the internal intermediate device (outputs) connected to the above clock line
@@ -216,8 +267,9 @@ class FPGADevice(PseudoclockDevice):
                     # no limits specified
                     pass
 
-            # do we need this?
             device_group.attrs['stop_time'] = self.stop_time
+            device_group.attrs['clock_limit'] = self.clock_limit
+            device_group.attrs['clock_resolution'] = self.clock_resolution
 
 
 class OutputIntermediateDevice(IntermediateDevice):
@@ -238,8 +290,8 @@ class OutputIntermediateDevice(IntermediateDevice):
 
         # disallow adding multiple devices
         if self.child_devices:
-            raise LabscriptError("Output '{}' is already connected to the OutputIntermediateDevice '{}'. Only one output is allowed.".format(
-                self.child_devices[0].name, self.name))
+            raise LabscriptError("Output '{}' is already connected to the OutputIntermediateDevice '{}'."
+                                 "Only one output is allowed.".format(self.child_devices[0].name, self.name))
         else:
             # allow the connection name to be "analog #" or "digital #" only
             try:
@@ -248,8 +300,8 @@ class OutputIntermediateDevice(IntermediateDevice):
                     raise ValueError
                 channel = int(channel)
             except ValueError:
-                raise LabscriptError("{} {} has invalid connection string '{}'. Format must be 'analog|digital #'.".format(device.description,
-                                                                                                                           device.name, str(device.connection)))
+                raise LabscriptError("{} {} has invalid connection string '{}'."
+                                     "Format must be 'analog|digital #'.".format(device.description, device.name, str(device.connection)))
             IntermediateDevice.add_device(self, device)
             self.output = device  # store reference to the output
 
@@ -270,7 +322,7 @@ class FPGADeviceTab(DeviceTab):
         # self.base_step
         # self.base_decimals
 
-        output_names = self.get_output_port_names()
+        output_names = self.get_output_port_names(self.connection_table, self.device_name)
         digital_properties = {}
         analog_properties = {}
 
@@ -291,12 +343,49 @@ class FPGADeviceTab(DeviceTab):
 
         self.supports_smart_programming(True)
 
+    """
+        # add more widgets
+        layout = self.get_tab_layout()
+
+        # FIXME: make this robust...
+        tp = layout.itemAt(0).widget().children()[0].append_new_palette("Parameters") #.parent().parent().append_new_palette("Test")
+
+        #dac_range_ui = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'dac_range.ui')
+        #layout.addLayout(dac_range_layout)
+
+        DAC_ranges = [(-10, 10), (-5, 5), (-2.5, 7.5), (-2.5, 2.5), (0, 5), (0, 10)]
+
+        self.comboboxes = []
+        for analog_output in analog_properties:
+            #dac_range_widget = QUiLoader().load(dac_range_ui)
+            dac_range_layout = QVBoxLayout()
+            parameter_widget = QGroupBox(analog_output)
+            parameter_widget.setLayout(dac_range_layout)
+
+            combobox = QComboBox()  #dac_range_widget.DACRangeComboBox
+            self.comboboxes.append(combobox)
+            combobox.currentIndexChanged.connect(self.combo_slot)
+
+            for i, DAC_range in enumerate(DAC_ranges):
+                combobox.addItem("{} to {} V".format(DAC_range[0], DAC_range[1]))
+                combobox.setItemData(i, DAC_range)
+            dac_range_layout.addWidget(combobox)
+            tp.addWidget(parameter_widget)
+            #dac_range_widget.OutputName.setText(analog_output)
+
+    @Slot(int)
+    @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
+    def combo_slot(self, index):
+        range_min = self.comboboxes[index].itemData(index)[0]
+        yield(self.queue_work(self.primary_worker, "send_parameter", 0, index, range_min))
+    """
+
     def get_output_port_names(self):
         """ Return list of connection names of the outputs attached, by inspecting the connection table. """
 
         output_names = []
         device_conn = self.connection_table.find_by_name(self.device_name)
- 
+
         # iterate over the pseudoclock connections and find the type of output ultimately attached to it
         for pseudoclock_conn in device_conn.child_list.values():
             clockline_conn = pseudoclock_conn.child_list.values()[0]
@@ -319,7 +408,7 @@ class FPGADeviceTab(DeviceTab):
         if parent_device_name == self.device_name:
             device_conn = self.connection_table.find_by_name(self.device_name)
 
-            pseudoclocks_conn = device_conn.child_list  # children of our pseudoclock device are just the pseudoclocks (
+            pseudoclocks_conn = device_conn.child_list  # children of our pseudoclock device are just the pseudoclocks
 
             for pseudoclock_conn in pseudoclocks_conn.values():
                 clockline_conn = pseudoclock_conn.child_list.values()[0]  # each pseudoclock has 1 child, a clockline
@@ -338,7 +427,7 @@ class FPGADeviceTab(DeviceTab):
         # when the pulseblaster is waiting. This indicates the end of
         # an experimental run.
         self.status, waits_pending = yield(self.queue_work(self.primary_worker, 'check_status'))
-        
+
         if notify_queue is not None and self.status['waiting'] and not waits_pending:
             # Experiment is over. Tell the queue manager about it, then
             # set the status checking timeout back to every 2 seconds
@@ -346,7 +435,7 @@ class FPGADeviceTab(DeviceTab):
             notify_queue.put('done')
             self.statemachine_timeout_remove(self.status_monitor)
             self.statemachine_timeout_add(2000, self.status_monitor)
-        
+
         # TODO: Update widgets
         # a = ['stopped','reset','running','waiting']
         # for name in a:
@@ -356,7 +445,7 @@ class FPGADeviceTab(DeviceTab):
             # else:                
                 # self.status_widgets[name+'_no'].show()
                 # self.status_widgets[name+'_yes'].hide()
-        
+
     @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
     def start(self, widget=None):
         yield(self.queue_work(self.primary_worker, 'start'))
@@ -397,6 +486,7 @@ class FPGADeviceWorker(Worker):
         self.start = self.interface.start
         self.stop = self.interface.stop
         self.reset = self.interface.reset
+        self.send_parameter = self.interface.send_parameter
 
         # cache for smart programming
         # initial_values attr is created by the DeviceTab initialise_workers method
@@ -517,28 +607,76 @@ class FPGADeviceWorker(Worker):
         pass
 
 
-"""
 @runviewer_parser
 class FPGARunViewerParser:
 
     def __init__(self, path, device):
         self.path = path
-        self.name = device.name
+        self.device_name = device.name
         self.device = device
 
-    def get_traces(self, add_trace, clock=None):
-        if clock is not None:
-            times, clock_value = clock[0], clock[1]
-            clock_indices = np.where((clock_value[1:] - clock_value[:-1]) == 1)[0] + 1
-            # If initial clock value is 1, then this counts as a rising edge (clock should be 0 before experiment)
-            # but this is not picked up by the above code. So we insert it!
-            if clock_value[0] == 1:
-                clock_indices = np.insert(clock_indices, 0, 0)
-            clock_ticks = times[clock_indices]
-
         with h5py.File(self.path, 'r') as f:
-            clocks = f['devices'][self.name]['clocks'][:]
+            self.stop_time = f['devices'][self.device_name].attrs['stop_time']
+            self.clock_limit = f['devices'][self.device_name].attrs['clock_limit']
+            #self.clock_resolution = f['devices'][self.device_name].attrs['clock_resolution']
 
-        for output in clocks:
-            pass
-"""
+        connection_table = ConnectionTable(path)
+        self.output_port_names = get_output_port_names(connection_table, self.device_name)
+
+    def get_traces(self, add_trace, clock=None):
+        with h5py.File(self.path, 'r') as f:
+            clocks_group = f['devices'][self.device_name]['clocks']
+            analog_data_group = f['devices'][self.device_name]['analog_data']
+
+            for output_name in clocks_group:
+                # expand clocks & toggles to a list of times when a clock out occurs
+                change_times = expand_clock(clocks_group[output_name], self.clock_limit, self.stop_time)
+                if "analog" in output_name:
+                    data = analog_data_group[output_name].value
+                elif "digital" in output_name:
+                    # digital outs always have some state from t=0
+                    change_times = [0] + change_times
+                    # number of toggles in first instruction gives the initial state
+                    initial_state = clocks_group[output_name][0]["toggles"]
+                    # generate sequence of 0s and 1s starting on the initial state, for each change time
+                    data = [(initial_state + i) % 2 for i in range(len(change_times))]
+
+                # FIXME: add meaningful last values
+                add_trace(output_name, (change_times, data), '', '')
+
+        # FIXME: return clocklines_and_triggers (why?)
+        return {}
+
+        """
+        with h5py.File(self.path, 'r') as f:
+            clocks_group = f['devices'][self.device_name]['clocks']
+            #analog_data_group = f['devices'][self.device_name]['analog_data']
+
+            traces = dict.fromkeys(self.output_port_names, [])
+ 
+            times = []
+            states = []
+            clocks = {}
+            t = 0
+            for clock in clocks_group:
+                for tick in clocks_group[clock]:
+                    for i in range(tick['n_clocks']):
+                        for j in [0, 1]:
+                            t += tick['toggles']
+                            states.append(j)
+                            times.append(t)
+
+            clocks[clock] = (np.array(times), np.array(states))
+
+        clocklines_and_triggers = {}
+        for pseudoclock_name, pseudoclock in self.device.child_list.items():
+            clockline_name, clockline = pseudoclock.child_list.items()[0]
+            id_name, intermediate_device = clockline.child_list.items()[0]
+            channel_name, channel = intermediate_device.child_list.items()[0]
+
+            clocklines_and_triggers[clockline_name] = clocks
+
+            add_trace(clockline_name, clock, id_name, channel.parent_port)
+
+        return clocklines_and_triggers
+        """
