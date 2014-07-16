@@ -18,7 +18,6 @@ from labscript_utils.qtwidgets.toolpalette import ToolPaletteGroup
 import numpy as np
 import h5py
 
-import os
 
 # Example
 #
@@ -34,7 +33,6 @@ import os
 # analog0.ramp(0, duration=3, initial=0, final=1, samplerate=1e4)
 # stop(1)
 
-# FIXME: fix residual clock instruction issue
 
 def reduce_clock_instructions(clock):  # FIXME: clock_resolution?
     """ Combine consecutive instructions with the same period. """
@@ -72,6 +70,7 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
     """
 
     ct_clock = []
+
     for i, tick in enumerate(clock):
 
         # the first (toggles)/(clocks) has a special meaning,
@@ -95,8 +94,12 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
                 continue
 
         # period = int(round(tick['step'] / clock_resolution) * clock_resolution)
-        toggles = tick['reps']
+
+        # subtract 1 due to auto toggling
+        # FIXME: ensure this is valid at every step, might just be required after first instruction?
+        toggles = tick['reps'] - 1
         n_clocks = int(tick['step'] * clock_limit) - 1
+
         ct_clock.append((n_clocks, toggles))
 
     return ct_clock
@@ -105,6 +108,7 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
 def expand_clock(clock, clock_limit, stop_time):
     """ given a clocks/toggles clocking signal, return
         a list of times at which the clock ticks. """
+    # FIXME: add clock resolution stuff
     times = []
 
     for i, tick in enumerate(clock):
@@ -118,7 +122,6 @@ def expand_clock(clock, clock_limit, stop_time):
             for i in range(toggles):
                 new_time = times[-1] + (n_clocks / clock_limit)
                 # ensure we don't exceed the stop time
-                # may occur due to "residual" instructions
                 if new_time > stop_time:
                     break
                 else:
@@ -239,6 +242,10 @@ class FPGADevice(PseudoclockDevice):
             if output is None:
                 raise LabscriptError("OutputDevice '{}' has no Output connected!".format(self.output_devices[i].name))
 
+            #raw_clock = np.array([(d['step'], d['reps']) for d in pseudoclock.clock], dtype=[('period', float), ('reps', float)])
+            #raw_clock_group = device_group.create_group("raw_clocks")
+            #raw_clock_group.create_dataset(output_connection, data=raw_clock, compression=config.compression)
+ 
             # combine instructions with equal periods
             pseudoclock.clock = reduce_clock_instructions(pseudoclock.clock)  # , self.clock_resolution)
 
@@ -646,37 +653,3 @@ class FPGARunViewerParser:
 
         # FIXME: return clocklines_and_triggers (why?)
         return {}
-
-        """
-        with h5py.File(self.path, 'r') as f:
-            clocks_group = f['devices'][self.device_name]['clocks']
-            #analog_data_group = f['devices'][self.device_name]['analog_data']
-
-            traces = dict.fromkeys(self.output_port_names, [])
- 
-            times = []
-            states = []
-            clocks = {}
-            t = 0
-            for clock in clocks_group:
-                for tick in clocks_group[clock]:
-                    for i in range(tick['n_clocks']):
-                        for j in [0, 1]:
-                            t += tick['toggles']
-                            states.append(j)
-                            times.append(t)
-
-            clocks[clock] = (np.array(times), np.array(states))
-
-        clocklines_and_triggers = {}
-        for pseudoclock_name, pseudoclock in self.device.child_list.items():
-            clockline_name, clockline = pseudoclock.child_list.items()[0]
-            id_name, intermediate_device = clockline.child_list.items()[0]
-            channel_name, channel = intermediate_device.child_list.items()[0]
-
-            clocklines_and_triggers[clockline_name] = clocks
-
-            add_trace(clockline_name, clock, id_name, channel.parent_port)
-
-        return clocklines_and_triggers
-        """
