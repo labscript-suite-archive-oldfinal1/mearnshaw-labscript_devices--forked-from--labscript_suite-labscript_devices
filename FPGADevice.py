@@ -14,6 +14,7 @@ from PySide.QtUiTools import QUiLoader
 from PySide.QtCore import Qt, Slot
 from PySide.QtGui import QHBoxLayout, QWidget, QComboBox, QLabel, QVBoxLayout, QGroupBox
 from labscript_utils.qtwidgets.toolpalette import ToolPaletteGroup
+from labscript_devices.console import ConsoleWidget
 
 import numpy as np
 import h5py
@@ -32,6 +33,19 @@ import h5py
 # start()
 # analog0.ramp(0, duration=3, initial=0, final=1, samplerate=1e4)
 # stop(1)
+
+def flash(output, freq):
+    """Toggle an output high/low \
+        eg. flash(digital1, freq=10) # flash digi1 at 10 Hz"""
+
+    import time
+    t = 1.0 / freq
+
+    for i in range(10):
+        output.value = True
+        time.sleep(t)
+        output.value = False
+        time.sleep(t)
 
 
 def reduce_clock_instructions(clock):  # FIXME: clock_resolution?
@@ -329,7 +343,7 @@ class FPGADeviceTab(DeviceTab):
         # self.base_step
         # self.base_decimals
 
-        output_names = self.get_output_port_names(self.connection_table, self.device_name)
+        output_names = get_output_port_names(self.connection_table, self.device_name)
         digital_properties = {}
         analog_properties = {}
 
@@ -346,14 +360,43 @@ class FPGADeviceTab(DeviceTab):
         self.create_analog_outputs(analog_properties)
         self.create_digital_outputs(digital_properties)
         DDS_widgets, AO_widgets, DO_widgets = self.auto_create_widgets()
-        self.auto_place_widgets(AO_widgets, DO_widgets)
+
+        self.widgets = dict(DDS_widgets.items() + AO_widgets.items() + DO_widgets.items())
 
         self.supports_smart_programming(True)
 
-    """
+        DO_style = """
+                       QPushButton{
+                           background-color: #FF5757;
+                           border-radius: 6px;
+                           border: 1px;
+                           border-color: black;
+                           color: black;
+                       }
+
+                       QPushButton:checked{
+                           background-color: #3EE64C;
+                           color: black;
+                       }
+                    """
+
+        for output_name in DO_widgets:
+            DO_widgets[output_name].setStyleSheet(DO_style)
+
+        self.auto_place_widgets(AO_widgets, DO_widgets)
+
         # add more widgets
         layout = self.get_tab_layout()
+        #self.console.textChanged.connect(self.update_value)
 
+        functions = {'flash': flash}
+        outputs = {output_name.replace(' ', ''): VirtualOutput(output_name, tab=self, initial_value=0) for output_name in output_names}
+        output_list = {'outputs': [output_name.replace(' ', '') for output_name in output_names]}
+        locals_ = dict(functions.items() + outputs.items() + output_list.items())
+        self.console = ConsoleWidget(locals_=locals_)
+        layout.addWidget(self.console)
+
+        """
         # FIXME: make this robust...
         tp = layout.itemAt(0).widget().children()[0].append_new_palette("Parameters") #.parent().parent().append_new_palette("Test")
 
@@ -454,17 +497,17 @@ class FPGADeviceTab(DeviceTab):
                 # self.status_widgets[name+'_yes'].hide()
 
     @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
-    def start(self, widget=None):
+    def start(self):
         yield(self.queue_work(self.primary_worker, 'start'))
         self.status_monitor()
 
     @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
-    def stop(self, widget=None):
+    def stop(self):
         yield(self.queue_work(self.primary_worker, 'stop'))
         self.status_monitor()
 
     @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
-    def reset(self, widget=None):
+    def reset(self):
         yield(self.queue_work(self.primary_worker, 'reset'))
         self.status_monitor()
 
@@ -478,6 +521,15 @@ class FPGADeviceTab(DeviceTab):
         # poll status every 100ms to notify Queue Manager at end of shot
         self.statemachine_timeout_add(100, self.status_monitor, notify_queue)
 
+    #@Slot()
+    @define_state(MODE_MANUAL, True)  # FIXME: True or False?
+    def update_value(self, value, widget):
+        try:
+            self._AO[widget].set_value(value)
+        except KeyError:
+            self._DO[widget].set_value(value)
+        yield(self.queue_work(self.primary_worker, 'program_manual', {widget: value}))
+
 
 @BLACS_worker
 class FPGADeviceWorker(Worker):
@@ -487,7 +539,7 @@ class FPGADeviceWorker(Worker):
         # processes and won't be cleanly restarted when the subprocess is restarted."
         from labscript_devices.fpga_api import FPGAInterface
 
-        self.interface = FPGAInterface()
+        self.interface = FPGAInterface(0x0403, 0x6001)
 
         # define these aliases so that the DeviceTab class can see them
         self.start = self.interface.start
@@ -498,6 +550,7 @@ class FPGADeviceWorker(Worker):
         # cache for smart programming
         # initial_values attr is created by the DeviceTab initialise_workers method
         # and reflects the initial state of the front panel values for manual_program to inspect
+
         self.smart_cache = {'clocks': {}, 'data': {}, 'output_values': self.initial_values}
 
     def check_status(self):
@@ -653,3 +706,19 @@ class FPGARunViewerParser:
 
         # FIXME: return clocklines_and_triggers (why?)
         return {}
+
+
+class VirtualOutput(object):
+
+    def __init__(self, name, tab, initial_value):
+        self.name = name
+        self.tab = tab
+        self._value = initial_value
+
+    @property
+    def value(self):
+        return self._value
+
+    @value.setter
+    def value(self, value):
+        self.tab.update_value(value, widget=self.name)
