@@ -59,18 +59,17 @@ class FTDIError(Exception):
 
 def error_check(fn):
     """ decorator to check for and handle FTDI errors """
-
     def checked(*args):
         ret_val = fn(*args)  # libftdi python bindings don't accept kwargs
 
         # some functions return a tuple with the return code as its first value
         try:
             ft_status = ret_val[0]
+            ret_val = ret_val[1]  # don't return the error code
         except TypeError:
             ft_status = ret_val
-
-        # error values are negative or NULL pointer (None)
-        if (ft_status < 0): # or (ft_status is None)
+        # error values are negative (FIXME: or a null pointer, can we reliably test for that? None might be returned legitimately.)
+        if ft_status < 0:
             try:
                 # assume the context is the first argument (...not aware of a counterexample)
                 err_msg = "An FTDI error occurred while calling '{}'".format(fn.__name__)
@@ -81,7 +80,6 @@ def error_check(fn):
                 raise FTDIError(err_msg)
         else:
             return ret_val
-
     return checked
 
 # wrap ftdi functions in error checking/handling code
@@ -95,15 +93,25 @@ for member in ftdi_members:
         vars(ftdi)[name] = error_check(fn)
 
 
+class FPGAModes:
+    """Mode identifiers."""
+    realtime = 0
+    pseudoclock = 1
+    data = 2
+    parameter = 3
+    trigger = 4
+    repeat = 5
+
+
+class FPGAStates:
+    """State identifiers."""
+    shot_finished = '\x00'
+
+
 class FPGAInterface:
 
-    realtime_mode_identifier = 0
-    pseudoclock_mode_identifier = 1
-    data_mode_identifier = 2
-    parameter_mode_identifier = 3
-    trigger_mode_identifier = 4
-
-    def __init__(self, vendor_id=0x0403, product_id=0x6014):  # product_id=0x6001):
+    # default VID:PID are for the FT232 chip
+    def __init__(self, vendor_id=0x0403, product_id=0x6014):
         self.vendor_id = vendor_id
         self.product_id = product_id
 
@@ -134,25 +142,43 @@ class FPGAInterface:
         ftdi.free(self.c)
 
     def __del__(self):
-        # close device and free context when interface destroyed
+        # close device (and implicitly free context) when interface destroyed
         self.close()
 
-    def send_bytes(self, bytes_):
-        """ write a sequence of byte(s) to device. """
-        logging.debug("writing {} bytes: {}".format(len(bytes_), repr(bytes_)))
-        n_bytes_written = ftdi.write_data(self.c, bytes_, len(bytes_))
-        #n_bytes_written = ftdi.transfer_data_done(ftdi.write_data_submit(self.c, bytes_, len(bytes_)))
+    def send_bytes(self, bytes_, buffered=True):
+        """ write a sequence of byte(s) to device.
+            If buffered (default True) then value will be not be written until send_buffer is called. """
 
-        if n_bytes_written < len(bytes_):
-            raise FTDIError("Problem writing to device, check connection - device may be closed?")
+        if buffered:
+            self.write_buffer.append(bytes_)
+            logging.debug("buffered {} bytes: {}".format(len(bytes_), repr(bytes_)))
+        else:
+            self.send_buffer()  # send any currently buffered data so order is maintained
+            logging.debug("writing {} bytes: {}".format(len(bytes_), repr(bytes_)))
+            n_bytes_written = ftdi.write_data(self.c, bytes_, len(bytes_))
 
-        return n_bytes_written
+            if n_bytes_written < len(bytes_):
+                raise FTDIError("Problem writing to device, check connection - device may be closed?")
+
+            return n_bytes_written
+
+    def receive_bytes(self, n_bytes):
+        return ftdi.read_data(self.c, n_bytes)
+
+    def check_status(self):
+        """ Read a byte from device and interpret it as a status code."""
+        status = self.receive_bytes(n_bytes=1)
+        if status == FPGAStates.shot_finished:
+            return "Finished (Code: {}).".format(status)
+        else:
+            return "Not finished (Code: {}).".format(status)
 
     def send_buffer(self):
         """ send whatever is in the write_buffer to the device. """
-        byte_sequence = ''.join(self.write_buffer)
-        self.write_buffer = []  # clear the buffer
-        return self.send_bytes(byte_sequence)
+        if self.write_buffer:
+            byte_sequence = ''.join(self.write_buffer)
+            self.write_buffer = []  # clear the buffer
+            return self.send_bytes(byte_sequence, buffered=False)
 
     def send_value(self, value, n_bytes=None, buffered=True):
         """ Send value, optionally coercing to a fit specified number of bytes.
@@ -160,22 +186,20 @@ class FPGAInterface:
         bytes_ = value_to_bytes(value, length=n_bytes)
         if buffered:
             self.write_buffer.append(bytes_)
+            logging.debug("buffered {} bytes: {}".format(len(bytes_), repr(bytes_)))
         else:
-            return self.send_bytes(bytes_)
+            self.send_buffer()  # send any currently buffered data so order is maintained
+            return self.send_bytes(bytes_, buffered=False)
 
     def send_pseudoclock(self, board_number, channel_number, clock):
         """ Send pseudoclock to a given channel on a given board. """
         # send identifier (1 byte)
-        self.send_value(self.pseudoclock_mode_identifier, n_bytes=1)
-
+        self.send_value(FPGAModes.pseudoclock, n_bytes=1)
         # send board number (1 byte)
         self.send_value(board_number, n_bytes=1)
-
         # send channel number (1 byte)
         self.send_value(channel_number, n_bytes=1)
-
-        # takes 1 word (4 bytes) to send #clocks, and 1 to send toggles
-        n_words = 2 * len(clock)
+        n_words = 2 * len(clock)  # takes 1 word (4 bytes) to send #clocks, and 1 to send toggles
         # send number of words (1 byte)
         self.send_value(n_words, n_bytes=1)
 
@@ -193,17 +217,12 @@ class FPGAInterface:
             range_min, range_max are the min/max output voltages configured on the DAC on this channel
         """
         # send identifier
-        self.send_value(self.data_mode_identifier, n_bytes=1)
-
+        self.send_value(FPGAModes.data, n_bytes=1)
         # send board number
         self.send_value(board_number, n_bytes=1)
-
         # send channel number
         self.send_value(channel_number, n_bytes=1)
-
-        # address and data transmitted in a single word
-        n_words = len(data)
-
+        n_words = len(data)  # address and data transmitted in a single word
         # send number of words (NB. two bytes)
         self.send_value(n_words, n_bytes=2)
 
@@ -220,7 +239,6 @@ class FPGAInterface:
 
         self.send_buffer()
 
-
     def send_realtime_value(self, board_number, channel_number, value, range_min, range_max, output_type):
         """ Send value to an output in real-time.
             output_type is either 'analog' or 'digital'.
@@ -228,11 +246,9 @@ class FPGAInterface:
             Returns the (possibly coerced/quantized) value sent to the board. """
 
         # send mode identifier
-        self.send_value(self.realtime_mode_identifier, n_bytes=1)
-
+        self.send_value(FPGAModes.realtime, n_bytes=1)
         # send board number
         self.send_value(board_number, n_bytes=1)
-
         # send channel number
         self.send_value(channel_number, n_bytes=1)
 
@@ -251,25 +267,29 @@ class FPGAInterface:
     def send_parameter(self, board_number, channel_number, value):
         """ Update a parameter on an output. """
         # FIXME: need more info about the possible parameters etc.
-
         # send mode identifier
-        self.send_value(self.parameter_mode_identifier, n_bytes=1)
-
+        self.send_value(FPGAModes.parameter, n_bytes=1)
         # send board number
         self.send_value(board_number, n_bytes=1)
-
         # send channel number
         self.send_value(channel_number, n_bytes=1)
-
         # send the parameter
         self.send_value(value, n_bytes=1)
+        self.send_buffer()
 
+    def send_repeats_and_period(self, shot_reps, shot_period):
+        # send mode identifier
+        self.send_value(FPGAModes.repeat, n_bytes=1)
+        # send shot reps (2 bytes)
+        self.send_value(shot_reps, n_bytes=2)
+        # send shot period (8 bytes)
+        self.send_value(shot_period, n_bytes=8)
         self.send_buffer()
 
     def start(self):
         """ Trigger a shot. """
         try:
-            self.send_value(self.trigger_mode_identifier, n_bytes=1)
+            self.send_value(FPGAModes.trigger, n_bytes=1)
             self.send_buffer()
         except FTDIError as err:
             # supply some extra info
@@ -286,3 +306,5 @@ class FPGAInterface:
         ftdi.usb_reset(self.c)
         ftdi.usb_purge_buffers(self.c)
         logging.info("Reset chip.")
+
+

@@ -1,6 +1,6 @@
 # skeleton for the FPGA device with multiple pseudoclocks each connected to a single output
 
-from labscript_devices import labscript_device, BLACS_tab, BLACS_worker, runviewer_parser
+from labscript_devices import fpga_widgets_style, labscript_device, BLACS_tab, BLACS_worker, runviewer_parser
 
 from labscript import PseudoclockDevice, Pseudoclock, ClockLine, IntermediateDevice,\
     AnalogOut, DigitalOut, LabscriptError, config
@@ -14,6 +14,7 @@ from PySide.QtUiTools import QUiLoader
 from PySide.QtCore import Qt, Slot
 from PySide.QtGui import QHBoxLayout, QWidget, QComboBox, QLabel, QVBoxLayout, QGroupBox
 from labscript_utils.qtwidgets.toolpalette import ToolPaletteGroup
+
 
 import numpy as np
 import h5py
@@ -242,10 +243,6 @@ class FPGADevice(PseudoclockDevice):
             if output is None:
                 raise LabscriptError("OutputDevice '{}' has no Output connected!".format(self.output_devices[i].name))
 
-            #raw_clock = np.array([(d['step'], d['reps']) for d in pseudoclock.clock], dtype=[('period', float), ('reps', float)])
-            #raw_clock_group = device_group.create_group("raw_clocks")
-            #raw_clock_group.create_dataset(output_connection, data=raw_clock, compression=config.compression)
- 
             # combine instructions with equal periods
             pseudoclock.clock = reduce_clock_instructions(pseudoclock.clock)  # , self.clock_resolution)
 
@@ -278,13 +275,14 @@ class FPGADevice(PseudoclockDevice):
             device_group.attrs['clock_limit'] = self.clock_limit
             device_group.attrs['clock_resolution'] = self.clock_resolution
 
+    def wait(self, channel):
+        """Generate a non-blocking wait on the specified channel."""
+        pass
+
 
 class OutputIntermediateDevice(IntermediateDevice):
     """ An intermediate device that connects to some output device. """
 
-    # description = 
-
-    # what sort of outputs are required ?
     allowed_children = [AnalogOut, DigitalOut]
 
     def __init__(self, name, clock_line):
@@ -323,13 +321,14 @@ class FPGADeviceTab(DeviceTab):
 
     def initialise_GUI(self):
 
+        # FIXME: add these
         self.base_units = 'Hz'
         # self.base_min
         # self.base_max
         # self.base_step
         # self.base_decimals
 
-        output_names = self.get_output_port_names(self.connection_table, self.device_name)
+        output_names = get_output_port_names(self.connection_table, self.device_name)
         digital_properties = {}
         analog_properties = {}
 
@@ -346,46 +345,16 @@ class FPGADeviceTab(DeviceTab):
         self.create_analog_outputs(analog_properties)
         self.create_digital_outputs(digital_properties)
         DDS_widgets, AO_widgets, DO_widgets = self.auto_create_widgets()
+
+        self.style_widgets(AO_widgets, DO_widgets)
         self.auto_place_widgets(AO_widgets, DO_widgets)
 
         self.supports_smart_programming(True)
 
-    """
-        # add more widgets
-        layout = self.get_tab_layout()
-
-        # FIXME: make this robust...
-        tp = layout.itemAt(0).widget().children()[0].append_new_palette("Parameters") #.parent().parent().append_new_palette("Test")
-
-        #dac_range_ui = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'dac_range.ui')
-        #layout.addLayout(dac_range_layout)
-
-        DAC_ranges = [(-10, 10), (-5, 5), (-2.5, 7.5), (-2.5, 2.5), (0, 5), (0, 10)]
-
-        self.comboboxes = []
-        for analog_output in analog_properties:
-            #dac_range_widget = QUiLoader().load(dac_range_ui)
-            dac_range_layout = QVBoxLayout()
-            parameter_widget = QGroupBox(analog_output)
-            parameter_widget.setLayout(dac_range_layout)
-
-            combobox = QComboBox()  #dac_range_widget.DACRangeComboBox
-            self.comboboxes.append(combobox)
-            combobox.currentIndexChanged.connect(self.combo_slot)
-
-            for i, DAC_range in enumerate(DAC_ranges):
-                combobox.addItem("{} to {} V".format(DAC_range[0], DAC_range[1]))
-                combobox.setItemData(i, DAC_range)
-            dac_range_layout.addWidget(combobox)
-            tp.addWidget(parameter_widget)
-            #dac_range_widget.OutputName.setText(analog_output)
-
-    @Slot(int)
-    @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
-    def combo_slot(self, index):
-        range_min = self.comboboxes[index].itemData(index)[0]
-        yield(self.queue_work(self.primary_worker, "send_parameter", 0, index, range_min))
-    """
+    def style_widgets(self, AO_widgets, DO_widgets):
+        """ Apply stylesheets to widgets. """
+        for output_name in DO_widgets:
+            DO_widgets[output_name].setStyleSheet(fpga_widgets_style.DO_style)
 
     def get_output_port_names(self):
         """ Return list of connection names of the outputs attached, by inspecting the connection table. """
@@ -503,15 +472,6 @@ class FPGADeviceWorker(Worker):
     def check_status(self):
         # FIXME: implement
         return {'waiting': True}, False
-        """
-        if self.waits_pending:
-            try:
-                self.all_waits_finished.wait(self.h5file, timeout=0)
-                self.waits_pending = False
-            except zprocess.TimeoutError:
-                pass
-        return pb_read_status(), self.waits_pending
-        """
 
     def program_manual(self, values):
         """ Program device to output values when not executing a buffered shot, ie. realtime mode. """
