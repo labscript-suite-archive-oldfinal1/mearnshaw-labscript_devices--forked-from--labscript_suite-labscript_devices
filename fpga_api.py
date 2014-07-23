@@ -3,6 +3,7 @@
     Requires libftdi.
 """
 
+import ctypes
 import struct
 import inspect
 import logging
@@ -163,7 +164,14 @@ class FPGAInterface:
             return n_bytes_written
 
     def receive_bytes(self, n_bytes):
-        return ftdi.read_data(self.c, n_bytes)
+        try:
+            return ftdi.read_data(self.c, n_bytes)
+        except TypeError:
+            # old versions of library require a buffer
+            arr = ctypes.c_ubyte * n_bytes
+            cbuf = arr()
+            ftdi.read_data(self.c, ctypes.byref(cbuf), n_bytes)
+            return cbuf
 
     def check_status(self):
         """ Read a byte from device and interpret it as a status code."""
