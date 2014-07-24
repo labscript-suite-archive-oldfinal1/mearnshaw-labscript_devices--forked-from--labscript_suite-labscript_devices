@@ -167,11 +167,8 @@ class FPGAInterface:
         try:
             return ftdi.read_data(self.c, n_bytes)
         except TypeError:
-            # old versions of library require a buffer
-            arr = ctypes.c_ubyte * n_bytes
-            cbuf = arr()
-            ftdi.read_data(self.c, ctypes.byref(cbuf), n_bytes)
-            return cbuf
+            # don't think there's any way out of this...
+            raise NotImplementedError("read_data is broken in this version of libftdi, please upgrade.")
 
     def check_status(self):
         """ Read a byte from device and interpret it as a status code."""
