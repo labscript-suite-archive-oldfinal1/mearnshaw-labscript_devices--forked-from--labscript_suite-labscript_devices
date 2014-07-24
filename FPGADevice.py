@@ -5,6 +5,8 @@ from labscript_devices import fpga_widgets_style, labscript_device, BLACS_tab, B
 from labscript import PseudoclockDevice, Pseudoclock, ClockLine, IntermediateDevice,\
     AnalogOut, DigitalOut, LabscriptError, config
 
+from labscript import labscript
+
 from blacs.tab_base_classes import Worker, define_state, \
     MODE_MANUAL, MODE_TRANSITION_TO_BUFFERED, MODE_BUFFERED, MODE_TRANSITION_TO_MANUAL
 from blacs.device_base_class import DeviceTab
@@ -241,15 +243,23 @@ class FPGADevice(PseudoclockDevice):
             output_connection = output.connection
 
             if output is None:
-                raise LabscriptError("OutputDevice '{}' has no Output connected!".format(self.output_devices[i].name))
+                raise LabscriptError("OutputDevice '{}' has no Output connected!".format(output.name))
 
             # combine instructions with equal periods
             pseudoclock.clock = reduce_clock_instructions(pseudoclock.clock)  # , self.clock_resolution)
 
-            # change from period/reps system to clocks/toggles (see function for explanation)
-            ct_clock = convert_to_clocks_and_toggles(pseudoclock.clock, output, self.clock_limit)  # , self.clock_resolution)
+            # for digital outs, change from period/reps system to clocks/toggles (see function for explanation)
+            if "digital" in output.name:
+                pseudoclock.clock = convert_to_clocks_and_toggles(pseudoclock.clock, output, self.clock_limit)  # , self.clock_resolution)
+                clock_dtype = [('n_clocks', int), ('toggles', int)]
+            else:
+                # for other outputs (analog) we just use the period/reps form.
 
-            clock = np.array(ct_clock, dtype=[('n_clocks', int), ('toggles', int)])
+                # pack values into a data structure from which we can initialize an np array directly
+                pseudoclock.clock = [tuple(tick.values()) for tick in pseudoclock.clock]
+                clock_dtype = [('period', int), ('reps', int)]
+
+            clock = np.array(pseudoclock.clock, dtype=clock_dtype)
 
             clock_group.create_dataset(output_connection,
                                        data=clock,
@@ -275,9 +285,14 @@ class FPGADevice(PseudoclockDevice):
             device_group.attrs['clock_limit'] = self.clock_limit
             device_group.attrs['clock_resolution'] = self.clock_resolution
 
-    def wait(self, channel):
-        """Generate a non-blocking wait on the specified channel."""
-        pass
+    def wait(self, label, t, connection, value, channel, timeout):
+        """At time t generate a non-blocking wait on the specified channel
+        until specified value is reached on specified channel."""
+        labscript.wait(label, t, timeout)
+
+
+class FPGAWaitMonitor:
+    pass
 
 
 class OutputIntermediateDevice(IntermediateDevice):
@@ -377,6 +392,11 @@ class FPGADeviceTab(DeviceTab):
         # pass initial front panel values to worker for manual programming cache
         self.create_worker("main_worker", FPGADeviceWorker, {'initial_values': initial_values})
         self.primary_worker = "main_worker"
+
+        # FIXME: instatiate this worker only if we have waits
+        # worker to acquire input values in real time for use in wait conditions
+        # self.create_worker("acquisition_worker", AcquisitionWorker)
+        # self.add_secondary_worker("acquisition_worker")
 
     def get_child_from_connection_table(self, parent_device_name, port):
         """ Return connection object for the output connected to an IntermediateDevice via the port specified. """
@@ -574,6 +594,12 @@ class FPGADeviceWorker(Worker):
         pass
 
 
+#@BLACS_worker
+#class AcquisitionWorker(Worker):
+    #"""Check input values in real time."""
+    #pass
+
+
 @runviewer_parser
 class FPGARunViewerParser:
 
@@ -613,3 +639,5 @@ class FPGARunViewerParser:
 
         # FIXME: return clocklines_and_triggers (why?)
         return {}
+
+
