@@ -8,6 +8,8 @@ import struct
 import inspect
 import logging
 
+from labscript_devices.FPGADevice import FPGAWait
+
 logging.basicConfig(level=logging.DEBUG)
 
 try:
@@ -102,6 +104,7 @@ class FPGAModes:
     parameter = 3
     trigger = 4
     repeat = 5
+    wait = 6
 
 
 class FPGAStates:
@@ -208,12 +211,35 @@ class FPGAInterface:
         # send number of words (1 byte)
         self.send_value(n_words, n_bytes=1)
 
-        # send clocks and toggles, each is packed into a 4 byte word
+        # send clocks/toggles (period/reps for analog), each is packed into a 4 byte word
         for tick in clock:
-            self.send_value(tick['n_clocks'], n_bytes=4)
-            self.send_value(tick['toggles'], n_bytes=4)
+            self.send_value(tick[0], n_bytes=4)
+            self.send_value(tick[1], n_bytes=4)
 
         # submit bufferred values
+        self.send_buffer()
+
+    # FIXME: clarify this logic
+    def send_wait(self, board_number, channel_number, value, comparison):
+        # send wait identifier (1 byte)
+        self.send_value(FPGAModes.wait, n_bytes=1)
+
+        try:
+            self.send_value(board_number, n_bytes=1)
+            self.send_value(channel_number, n_bytes=1)
+        except TypeError:
+            # board/channel no. is nan, so we have a "PC Wait", no info to send
+            return
+
+        # analog waits have comparison
+        if comparison != FPGAWait.null_value:
+            # FIXME: remove hardcoded ranges
+            quantized_value, DAC_value = quantize_analog_value(value, range_min=0, range_max=5)
+            self.send_value(DAC_value, n_bytes=2)
+            self.send_value(comparison, n_bytes=1)
+        else:
+            self.send_value(value, n_bytes=1)
+ 
         self.send_buffer()
 
     def send_analog_data(self, board_number, channel_number, range_min, range_max, data):
