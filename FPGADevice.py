@@ -21,9 +21,6 @@ from labscript_utils.qtwidgets.toolpalette import ToolPaletteGroup
 import numpy as np
 import h5py
 
-import collections
-
-
 # Example
 #
 # import __init__ # only have to do this because we're inside the labscript directory
@@ -38,6 +35,33 @@ import collections
 # analog0.ramp(0, duration=3, initial=0, final=1, samplerate=1e4)
 # stop(1)
 
+class OutputConnectionName(str):
+    """The BLACS DeviceTab only has access to the connection table
+    and not to instances of the Devices themselves. This class allows
+    useful metadata to be encoded in/decoded from the connection string."""
+
+    def __new__(self, type_=None, board_num=None, channel_num=None, group_name=None):
+        name = "{}_{}_{}_{}".format(type_, board_num, channel_num, group_name)
+        return str.__new__(self, name)
+
+    def __init__(self, type_=None, board_num=None, channel_num=None, group_name=None):
+        self.type_ = type_
+        self.board_num = board_num
+        self.channel_num = channel_num
+        self.group_name = group_name
+        self.name = "{}_{}_{}_{}".format(type_, board_num, channel_num, group_name)
+
+    def __repr__(self):
+        return repr(self.name)
+
+    def __str__(self):
+        return self.name
+
+    # static because we'll typically use it after the instance has been reduced to a plain str
+    @staticmethod
+    def decode(name):
+        return name.split('_')
+
 
 def reduce_clock_instructions(clock):  # FIXME: clock_resolution?
     """ Combine consecutive instructions with the same period. """
@@ -46,7 +70,7 @@ def reduce_clock_instructions(clock):  # FIXME: clock_resolution?
     for instruction in clock:
         if instruction == 'WAIT':
             # The following period and reps indicates a wait instruction
-            reduced_instructions.append({'step': 0, 'reps': 0})
+            reduced_instructions.append({'step': 255, 'reps': 255})
             continue
         reps = instruction['reps']
         step = instruction['step']
@@ -82,9 +106,9 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
         # which specifies (the inital state)/(# clocks to hold it for)
         # NB. n_clocks=n => wait n-1 clock cycles before toggling
         if i == 0:
-            if isinstance(output, DigitalOut):
+            if isinstance(output, FPGADigitalOut):
                 initial_state = output.raw_output[0]
-            elif isinstance(output, AnalogOut):
+            elif isinstance(output, FPGAAnalogOut):
                 # for analog outputs, board expects zero as initial clock state
                 initial_state = 0
             else:
@@ -146,14 +170,12 @@ def get_output_port_names(connection_table, device_name):
         clockline_conn = pseudoclock_conn.child_list.values()[0]
         id_conn = clockline_conn.child_list.values()[0]
         output_conn = id_conn.child_list.values()[0]
-
-        output_names.append(output_conn.parent_port)
+        output_names.append((output_conn.name, output_conn.parent_port))
 
     return output_names
 
 
 class FPGAWait:
-
     # h5py doesn't support None... FIXME: reconsider this class
     null_value = np.nan
 
@@ -164,24 +186,37 @@ class FPGAWait:
         self.comparison = comparison if comparison is not None else self.null_value
 
 
+class FPGAAnalogOut(AnalogOut):
+    def __init__(self, name, parent_device, board_number=0, channel_number=None, group_name=None, *args, **kwargs):
+        connection = OutputConnectionName("analog", board_number, channel_number, group_name)
+        AnalogOut.__init__(self, name, parent_device, connection, *args, **kwargs)
+
+
+class FPGADigitalOut(DigitalOut):
+    def __init__(self, name, parent_device, board_number=0, channel_number=None, group_name=None, *args, **kwargs):
+        connection = OutputConnectionName("digital", board_number, channel_number, group_name)
+        DigitalOut.__init__(self, name, parent_device, connection, *args, **kwargs)
+
+
 @labscript_device
 class FPGADevice(PseudoclockDevice):
     """ A device with indiviually pseudoclocked outputs. """
+    max_clock_instructions = 256  # max number of pairs of p/r or c/t per channel
+    max_analog_data = 2**16 - 1  # max number of words for the analog channels
 
     clock_limit = 100e6  # 100 MHz
     clock_resolution = 1e-9  # true value?
 
     description = "FPGA-Device"
-    allowed_children = [Pseudoclock]
+    allowed_children = [Pseudoclock, DigitalOut]
 
     def __init__(self, name, n_analog=None, n_digital=None):
         """ n_analog: number of analog outputs expected (optional, unlimited if unspecified)
             n_digital: number of digital outputs expected (optional, unlimited if unspecified)
         """
-        # device is triggered by PC, so trigger device is None and this device becomes the master_pseudoclock
         PseudoclockDevice.__init__(self, name)
 
-        self.BLACS_connection = None  # FIXME: make this something useful?
+        self.BLACS_connection = None
 
         # number of outputs of each type that device should have, if specified
         self.n_analog = n_analog
@@ -190,11 +225,7 @@ class FPGADevice(PseudoclockDevice):
         self.pseudoclocks = []
         self.clocklines = []
         self.output_devices = []
-
         self.waits = []
-
-    # restrict devices here?
-    #def add_device(...):
 
     @property
     def outputs(self):
@@ -209,18 +240,33 @@ class FPGADevice(PseudoclockDevice):
         if n == max_n:
             raise LabscriptError("Cannot connect more than {} outputs to the device '{}'".format(n, self.name))
         else:
-            pc = Pseudoclock("fpga_pseudoclock{}".format(n), self, "clock_{}".format(n))
+            pc = Pseudoclock("{}_pseudoclock{}".format(self.name, n), self, "{}_clock_{}".format(self.name, n))
             self.pseudoclocks.append(pc)
 
             # Create the internal direct output clock_line
-            cl = ClockLine("fpga_output{}_clock_line".format(n), pc, "fpga_internal{}".format(n))
+            cl = ClockLine("{}_output{}_clock_line".format(self.name, n), pc, "{}_internal{}".format(self.name, n))
             # FIXME: do we really need to store the list of clocklines?
             self.clocklines.append(cl)
 
             # Create the internal intermediate device (outputs) connected to the above clock line
-            oid = OutputIntermediateDevice("fpga_output_device{}".format(n), cl)
+            oid = OutputIntermediateDevice("{}_output_device{}".format(self.name, n), cl)
             self.output_devices.append(oid)
             return oid
+
+    def trigger(self, t, duration, wait_delay=0):
+        """Ask the trigger device to produce a digital pulse of a given duration to trigger this pseudoclock.
+           We override this method here to remove the checking for WaitMonitor, we don't require one.""" 
+        if t == 'initial':
+            t = self.initial_trigger_time
+        t = round(t, 10)
+        if self.is_master_pseudoclock:
+            # FIXME: do we need this pulse?
+            # Make the wait monitor pulse to signify starting or resumption of the experiment:
+            # labscript.compiler.wait_monitor.trigger(t, duration)
+            self.trigger_times.append(t)
+        else:
+            self.trigger_device.trigger(t, duration)
+            self.trigger_times.append(round(t + wait_delay, 10))
 
     def wait(self, at_time, board_number=None, channel_number=None, value=None, comparison=None):
         # ensure we have an entry in the labscript compiler wait table
@@ -228,13 +274,11 @@ class FPGADevice(PseudoclockDevice):
         self.waits.append(FPGAWait(board_number, channel_number, value, comparison))
 
     def generate_code(self, hdf5_file):
-        # FIXME: restrict length of clock instructions/data based on hardware limitations
-
         # check that correct number of outputs are attached
         outputs = [output_device.output.__class__ for output_device in self.output_devices]
 
-        n_analog = outputs.count(AnalogOut)
-        n_digital = outputs.count(DigitalOut)
+        n_analog = outputs.count(FPGAAnalogOut)
+        n_digital = outputs.count(FPGADigitalOut)
 
         # expected number not specified => whatever we have is correct
         if not self.n_digital:
@@ -266,9 +310,7 @@ class FPGADevice(PseudoclockDevice):
             wait = np.array(tuple(wait.values()), dtype=dtype)
             waits_group.create_dataset("wait{}".format(i), data=wait, compression=config.compression)
 
-
         for i, pseudoclock in enumerate(self.pseudoclocks):
-
             output = self.output_devices[i].output
             output_connection = output.connection
 
@@ -289,18 +331,29 @@ class FPGADevice(PseudoclockDevice):
                 pseudoclock.clock = [tuple(tick.values()) for tick in pseudoclock.clock]
                 clock_dtype = [('period', int), ('reps', int)]
 
+            if len(pseudoclock.clock) > self.max_clock_instructions:
+                raise LabscriptError("Cannot exceed more than {} clock"
+                                     "instructions per channel ({} requested)".format(self.max_clock_instructions, len(pseudoclock.clock)))
+
             clock = np.array(pseudoclock.clock, dtype=clock_dtype)
 
             clock_group.create_dataset(output_connection,
                                        data=clock,
                                        compression=config.compression)
 
+            #clock_group[output_connection].attrs['board_number'] = output.board_number
+
             # we only need to save analog data, digital outputs are
             # constructed from the clocks/toggles clocking signal
-            if isinstance(output, AnalogOut):
-                analog_data_group.create_dataset(output_connection,
-                                                 data=output.raw_output,
-                                                 compression=config.compression)
+            if isinstance(output, FPGAAnalogOut):
+                if len(output.raw_output) > self.max_analog_data:
+                    raise LabscriptError("Cannot exceed more than {} analog data"
+                                         "points per channel ({} requested)".format(self.max_analog_data, len(output.raw_output)))
+                else:
+                    analog_data_group.create_dataset(output_connection,
+                                                     data=output.raw_output,
+                                                     compression=config.compression)
+
                 # also save the limits of the output
                 try:
                     limits = np.array(output.limits, dtype=[('range_min', float), ('range_max', float)])
@@ -316,14 +369,10 @@ class FPGADevice(PseudoclockDevice):
             device_group.attrs['clock_resolution'] = self.clock_resolution
 
 
-class FPGAWaitMonitor:
-    pass
-
-
 class OutputIntermediateDevice(IntermediateDevice):
     """ An intermediate device that connects to some output device. """
 
-    allowed_children = [AnalogOut, DigitalOut]
+    allowed_children = [FPGAAnalogOut, FPGADigitalOut]
 
     def __init__(self, name, clock_line):
         IntermediateDevice.__init__(self, name, clock_line)
@@ -338,15 +387,6 @@ class OutputIntermediateDevice(IntermediateDevice):
             raise LabscriptError("Output '{}' is already connected to the OutputIntermediateDevice '{}'."
                                  "Only one output is allowed.".format(self.child_devices[0].name, self.name))
         else:
-            # allow the connection name to be "analog #" or "digital #" only
-            try:
-                prefix, channel = device.connection.split(' ')
-                if prefix != "analog" and prefix != "digital":
-                    raise ValueError
-                channel = int(channel)
-            except ValueError:
-                raise LabscriptError("{} {} has invalid connection string '{}'."
-                                     "Format must be 'analog|digital #'.".format(device.description, device.name, str(device.connection)))
             IntermediateDevice.add_device(self, device)
             self.output = device  # store reference to the output
 
@@ -369,21 +409,22 @@ class FPGADeviceTab(DeviceTab):
         # self.base_decimals
 
         output_names = get_output_port_names(self.connection_table, self.device_name)
-        digital_properties = {}
-        analog_properties = {}
+        self.digital_properties = {}
+        self.analog_properties = {}
 
         # properties['base_unit'], properties['min'], properties['max'], properties['step'], properties['decimals']
-        for name in output_names:
+        for name, conn_name in output_names:
             # the name format assumed here is enforced by add_device method of our IntermediateDevice
-            output_type, num = name.split()
+            output_type, board_number, channel_number, group_name = OutputConnectionName.decode(conn_name)
             if output_type == "analog":
-                analog_properties[name] = {'base_unit': self.base_units,
+                self.analog_properties[name] = {'conn_name': conn_name,
+                                           'base_unit': self.base_units,
                                            'min': 0.0, 'max': 10.0, 'step': 0.1, 'decimals': 3}
             elif output_type == "digital":
-                digital_properties[name] = {}
+                self.digital_properties[name] = {'conn_name': conn_name}
 
-        self.create_analog_outputs(analog_properties)
-        self.create_digital_outputs(digital_properties)
+        self.create_analog_outputs(self.analog_properties)
+        self.create_digital_outputs(self.digital_properties)
         DDS_widgets, AO_widgets, DO_widgets = self.auto_create_widgets()
 
         self.style_widgets(AO_widgets, DO_widgets)
@@ -396,26 +437,12 @@ class FPGADeviceTab(DeviceTab):
         for output_name in DO_widgets:
             DO_widgets[output_name].setStyleSheet(fpga_widgets_style.DO_style)
 
-    def get_output_port_names(self):
-        """ Return list of connection names of the outputs attached, by inspecting the connection table. """
-
-        output_names = []
-        device_conn = self.connection_table.find_by_name(self.device_name)
-
-        # iterate over the pseudoclock connections and find the type of output ultimately attached to it
-        for pseudoclock_conn in device_conn.child_list.values():
-            clockline_conn = pseudoclock_conn.child_list.values()[0]
-            id_conn = clockline_conn.child_list.values()[0]
-            output_conn = id_conn.child_list.values()[0]
-
-            output_names.append(output_conn.parent_port)
-
-        return output_names
-
     def initialise_workers(self):
         initial_values = self.get_front_panel_values()
         # pass initial front panel values to worker for manual programming cache
-        self.create_worker("main_worker", FPGADeviceWorker, {'initial_values': initial_values})
+
+        self.create_worker("main_worker", FPGADeviceWorker, {'initial_values': initial_values, 'analog_properties': self.analog_properties, 
+                            'digital_properties': self.digital_properties})
         self.primary_worker = "main_worker"
 
         # FIXME: instatiate this worker only if we have waits
@@ -516,6 +543,7 @@ class FPGADeviceWorker(Worker):
 
     def check_status(self):
         # FIXME: implement
+        # self.interface.check_status ...
         return {'waiting': True}, False
 
     def program_manual(self, values):
@@ -528,14 +556,17 @@ class FPGADeviceWorker(Worker):
 
             # only update output if it has changed
             if value != self.smart_cache['output_values'].get(output_name):
-                output_type, channel_number = output_name.split()
-                channel_number = int(channel_number)
+                try:
+                    conn_name = self.analog_properties[output_name]['conn_name']
+                except KeyError:
+                    conn_name = self.digital_properties[output_name]['conn_name']
 
+                output_type, board_number, channel_number, group_name = OutputConnectionName.decode(conn_name)
                 # the value sent to the board may be coerced/quantized from the one requested
                 # send_realtime_value returns the actual value the board is now outputting
                 # so we can update the front panel to accurately reflect this
-                # FIXME: remove hardcoded board number and range values
-                new_value = self.interface.send_realtime_value(0, channel_number, value, 0, 10, output_type)
+                # FIXME: remove hardcoded range values
+                new_value = self.interface.send_realtime_value(int(board_number), int(channel_number), value, 0, 10, output_type)
                 modified_values[output_name] = new_value
                 self.smart_cache['output_values'][output_name] = new_value
 
@@ -546,10 +577,8 @@ class FPGADeviceWorker(Worker):
         device to move into buffered mode in preparation for executing a buffered sequence. """
 
         with h5py.File(h5file, 'r') as hdf5_file:
-            device_group = hdf5_file["devices"][device_name]
+            device_group = hdf5_file['devices'][device_name]
 
-            # FIXME: might be better to make local copies of these so h5 file
-            # can be closed sooner (in theory could speed up experiment cycle)
             clocks = device_group['clocks']
             analog_data = device_group['analog_data']
             limits = device_group['analog_limits']
@@ -564,8 +593,11 @@ class FPGADeviceWorker(Worker):
                 # only send if it has changed or fresh program is requested
                 if fresh_program or np.any(clock != self.smart_cache['clocks'].get(output)):
                     self.smart_cache['clocks'][output] = clock
-                    # FIXME: remove hardcoded board_number
-                    self.interface.send_pseudoclock(board_number=0, channel_number=i, clock=clock)
+
+                    #board_number = clocks[output].attrs['board_number']
+                    
+                    output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output)
+                    self.interface.send_pseudoclock(int(board_number), int(channel_number), clock=clock)
 
                 # if there is no entry for this output in the analog data group, it must be a digital out
                 if not analog_data.get(output):
@@ -586,8 +618,9 @@ class FPGADeviceWorker(Worker):
                     except KeyError:
                         # FIXME: what should the default range be?
                         range_min, range_max = 0, 5
-                    # FIXME: remove hardcoded board_number
-                    self.interface.send_analog_data(board_number=0, channel_number=i,
+                    #board_number = clocks[output].attrs['board_number']
+                    output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output)
+                    self.interface.send_analog_data(int(board_number), int(channel_number),
                                                     range_min=range_min, range_max=range_max, data=data)
             
             # send the waits
@@ -645,7 +678,7 @@ class FPGARunViewerParser:
             #self.clock_resolution = f['devices'][self.device_name].attrs['clock_resolution']
 
         connection_table = ConnectionTable(path)
-        self.output_port_names = get_output_port_names(connection_table, self.device_name)
+        self.output_port_names = [i[1] for i in get_output_port_names(connection_table, self.device_name)]
 
     def get_traces(self, add_trace, clock=None):
         with h5py.File(self.path, 'r') as f:
