@@ -3,28 +3,24 @@
     Requires libftdi.
 """
 
-import ctypes
 import struct
 import inspect
 import logging
 
 from labscript_devices.FPGADevice import FPGAWait
 
-logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger('main')
+logger.setLevel(logging.DEBUG)
+file_handler = logging.FileHandler('/home/matt/sequence.log')
+file_handler.setLevel(logging.DEBUG)
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
 
-try:
-    import ftdi1 as ftdi
-except ImportError:
-    import ftdi
-    # in this version of the library method names prefixed with ftdi_
-    # rename them to exclude this prefix
-    ftdi_members = inspect.getmembers(ftdi)
-    for member in ftdi_members:
-        name, fn = member
-        new_name = name.replace("ftdi_", "")
-        if new_name != name:
-            vars(ftdi)[new_name] = fn
-            del vars(ftdi)[name]
+import ftdi1 as ftdi
+
+buffered = False
 
 
 def value_to_bytes(i, length=None):
@@ -104,7 +100,10 @@ class FPGAModes:
     parameter = 3
     trigger = 4
     repeat = 5
-    wait = 6
+    pc_wait = 6
+    digital_wait = 7
+    analog_wait = 8
+    wait_times = 9
 
 
 class FPGAStates:
@@ -139,7 +138,6 @@ class FPGAInterface:
         ftdi.usb_purge_buffers(self.c)
         ftdi.set_bitmode(self.c, 0xFF, bitmode)
 
-    # FIXME: make this class a proper context manager instead?
     def close(self):
         # close device and free context
         ftdi.usb_close(self.c)
@@ -149,16 +147,16 @@ class FPGAInterface:
         # close device (and implicitly free context) when interface destroyed
         self.close()
 
-    def send_bytes(self, bytes_, buffered=True):
+    def send_bytes(self, bytes_, buffered=buffered):
         """ write a sequence of byte(s) to device.
             If buffered (default True) then value will be not be written until send_buffer is called. """
 
         if buffered:
             self.write_buffer.append(bytes_)
-            logging.debug("buffered {} bytes: {}".format(len(bytes_), repr(bytes_)))
+            #logging.debug("buffered {} bytes: {}".format(len(bytes_), repr(bytes_)))
         else:
             self.send_buffer()  # send any currently buffered data so order is maintained
-            logging.debug("writing {} bytes: {}".format(len(bytes_), repr(bytes_)))
+            logger.debug("writing {} bytes: {}".format(len(bytes_), repr(bytes_)))
             n_bytes_written = ftdi.write_data(self.c, bytes_, len(bytes_))
 
             if n_bytes_written < len(bytes_):
@@ -188,13 +186,13 @@ class FPGAInterface:
             self.write_buffer = []  # clear the buffer
             return self.send_bytes(byte_sequence, buffered=False)
 
-    def send_value(self, value, n_bytes=None, buffered=True):
+    def send_value(self, value, n_bytes=None, buffered=buffered):
         """ Send value, optionally coercing to a fit specified number of bytes.
             If buffered (default True) then value will be not be written until send_buffer is called. """
         bytes_ = value_to_bytes(value, length=n_bytes)
         if buffered:
             self.write_buffer.append(bytes_)
-            logging.debug("buffered {} bytes: {}".format(len(bytes_), repr(bytes_)))
+            #logging.debug("buffered {} bytes: {} ({})".format(len(bytes_), repr(bytes_), value))
         else:
             self.send_buffer()  # send any currently buffered data so order is maintained
             return self.send_bytes(bytes_, buffered=False)
@@ -207,39 +205,47 @@ class FPGAInterface:
         self.send_value(board_number, n_bytes=1)
         # send channel number (1 byte)
         self.send_value(channel_number, n_bytes=1)
-        n_words = 2 * len(clock)  # takes 1 word (4 bytes) to send #clocks, and 1 to send toggles
+        n_words = len(clock)  # takes 1 word (4 bytes) to send #clocks, and 1 to send toggles
         # send number of words (1 byte)
         self.send_value(n_words, n_bytes=1)
 
-        # send clocks/toggles (period/reps for analog), each is packed into a 4 byte word
+        # send clocks/toggles (reps/period for analog), each is packed into a 4 byte word
         for tick in clock:
-            self.send_value(tick[0], n_bytes=4)
             self.send_value(tick[1], n_bytes=4)
+            self.send_value(tick[0], n_bytes=4)
 
         # submit bufferred values
         self.send_buffer()
 
-    # FIXME: clarify this logic
-    def send_wait(self, board_number, channel_number, value, comparison):
-        # send wait identifier (1 byte)
-        self.send_value(FPGAModes.wait, n_bytes=1)
-
-        try:
-            self.send_value(board_number, n_bytes=1)
-            self.send_value(channel_number, n_bytes=1)
-        except TypeError:
-            # board/channel no. is nan, so we have a "PC Wait", no info to send
-            return
+    # FIXME: clarify this logic!
+    def send_wait_info(self, board_number, channel_number, value, comparison):
 
         # analog waits have comparison
         if comparison != FPGAWait.null_value:
+            self.send_value(FPGAModes.analog_wait, n_bytes=1)
+            self.send_value(board_number, n_bytes=1)
+            self.send_value(channel_number, n_bytes=1)
             # FIXME: remove hardcoded ranges
             quantized_value, DAC_value = quantize_analog_value(value, range_min=0, range_max=5)
             self.send_value(DAC_value, n_bytes=2)
             self.send_value(comparison, n_bytes=1)
         else:
+            # we have digital or pc wait
+            try:
+                self.send_value(board_number, n_bytes=1)
+            except TypeError:
+                # board/channel no. is nan, so we have a "PC Wait"
+                self.send_value(FPGAModes.pc_wait, n_bytes=1)
+
+            self.send_value(channel_number, n_bytes=1)
             self.send_value(value, n_bytes=1)
  
+        self.send_buffer()
+
+    def send_wait_times(self, times):
+        self.send_value(FPGAModes.wait_times, n_bytes=1)
+        for time in times:
+            self.send_value(int(time), n_bytes=8)
         self.send_buffer()
 
     def send_analog_data(self, board_number, channel_number, range_min, range_max, data):
@@ -296,7 +302,7 @@ class FPGAInterface:
         return value
 
     def send_parameter(self, board_number, channel_number, value):
-        """ Update a parameter on an output. """
+        """Update a parameter on an output."""
         # FIXME: need more info about the possible parameters etc.
         # send mode identifier
         self.send_value(FPGAModes.parameter, n_bytes=1)
@@ -318,8 +324,9 @@ class FPGAInterface:
         self.send_buffer()
 
     def start(self):
-        """ Trigger a shot. """
+        """Trigger a shot."""
         try:
+            logger.debug("triggering")
             self.send_value(FPGAModes.trigger, n_bytes=1)
             self.send_buffer()
         except FTDIError as err:
@@ -327,11 +334,11 @@ class FPGAInterface:
             raise FTDIError("Error occurred while trying to send trigger: {}".format(err.message))
 
     def stop(self):
-        """ Stop output of board. """
+        """Stop output of board."""
         pass
 
     def reset(self):
-        """ Reset board. """
+        """Reset board."""
         logging.info("Resetting chip.")
         ftdi.set_bitmode(self.c, 0xFF, ftdi.BITMODE_RESET)
         ftdi.usb_reset(self.c)

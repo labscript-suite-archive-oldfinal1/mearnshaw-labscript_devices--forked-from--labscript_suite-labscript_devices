@@ -20,6 +20,9 @@ from labscript_utils.qtwidgets.toolpalette import ToolPaletteGroup
 
 import numpy as np
 import h5py
+import logging
+
+logger = logging.getLogger("main")
 
 # Example
 #
@@ -63,14 +66,25 @@ class OutputConnectionName(str):
         return name.split('_')
 
 
+def process_analog_clock(clock, clock_limit):
+    processed_clock = []
+    for i, tick in enumerate(clock):
+        # max update rate of DACs is ~1000 * the fundamental frequency, don't allow faster updates
+        # FIXME: let labscript handle this via clock_resolution
+        if tick['step'] * clock_limit < 1000:
+            print "Requested update rate exceeds that of the DACs ({}), discarding".format(tick['step'])
+        else:
+            processed_clock.append((tick['step'] * clock_limit, tick['reps']))
+    return processed_clock
+
+
 def reduce_clock_instructions(clock):  # FIXME: clock_resolution?
     """ Combine consecutive instructions with the same period. """
 
     reduced_instructions = []
     for instruction in clock:
         if instruction == 'WAIT':
-            # The following period and reps indicates a wait instruction
-            reduced_instructions.append({'step': 255, 'reps': 255})
+            reduced_instructions.append(instruction)
             continue
         reps = instruction['reps']
         step = instruction['step']
@@ -106,13 +120,7 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
         # which specifies (the inital state)/(# clocks to hold it for)
         # NB. n_clocks=n => wait n-1 clock cycles before toggling
         if i == 0:
-            if isinstance(output, FPGADigitalOut):
-                initial_state = output.raw_output[0]
-            elif isinstance(output, FPGAAnalogOut):
-                # for analog outputs, board expects zero as initial clock state
-                initial_state = 0
-            else:
-                raise LabscriptError("Conversion to clocks and toggles not supported for output type '{}'.".format(output.__class__.__name__))
+            initial_state = output.raw_output[0]
 
             n_clocks = int(tick['step'] * clock_limit) - 1
             ct_clock.append((n_clocks, initial_state))
@@ -155,7 +163,6 @@ def expand_clock(clock, clock_limit, stop_time):
                     break
                 else:
                     times.append(new_time)
-
     return times
 
 
@@ -183,7 +190,7 @@ class FPGAWait:
         self.board_number = board_number if board_number is not None else self.null_value
         self.channel_number = channel_number if channel_number is not None else self.null_value
         self.value = value if value is not None else self.null_value
-        self.comparison = comparison if comparison is not None else self.null_value
+        self.comparison = ord(comparison) if comparison is not None else self.null_value
 
 
 class FPGAAnalogOut(AnalogOut):
@@ -204,8 +211,8 @@ class FPGADevice(PseudoclockDevice):
     max_clock_instructions = 256  # max number of pairs of p/r or c/t per channel
     max_analog_data = 2**16 - 1  # max number of words for the analog channels
 
-    clock_limit = 100e6  # 100 MHz
-    clock_resolution = 1e-9  # true value?
+    clock_limit = 30e6  # 30 MHz
+    clock_resolution = 1000.0 / clock_limit
 
     description = "FPGA-Device"
     allowed_children = [Pseudoclock, DigitalOut]
@@ -226,6 +233,7 @@ class FPGADevice(PseudoclockDevice):
         self.clocklines = []
         self.output_devices = []
         self.waits = []
+        self.wait_times = []
 
     @property
     def outputs(self):
@@ -255,7 +263,7 @@ class FPGADevice(PseudoclockDevice):
 
     def trigger(self, t, duration, wait_delay=0):
         """Ask the trigger device to produce a digital pulse of a given duration to trigger this pseudoclock.
-           We override this method here to remove the checking for WaitMonitor, we don't require one.""" 
+           We override this method here to remove the checking for WaitMonitor, we don't require one."""
         if t == 'initial':
             t = self.initial_trigger_time
         t = round(t, 10)
@@ -270,8 +278,10 @@ class FPGADevice(PseudoclockDevice):
 
     def wait(self, at_time, board_number=None, channel_number=None, value=None, comparison=None):
         # ensure we have an entry in the labscript compiler wait table
-        labscript.wait(label='wait{}'.format(len(self.waits)), t=at_time, timeout=5)
+        self.wait_times.append(at_time * self.clock_limit)
+        # labscript.wait(label='wait{}'.format(len(self.waits)), t=at_time, timeout=5)
         self.waits.append(FPGAWait(board_number, channel_number, value, comparison))
+        # FIXME: return a time!
 
     def generate_code(self, hdf5_file):
         # check that correct number of outputs are attached
@@ -302,6 +312,7 @@ class FPGADevice(PseudoclockDevice):
         analog_data_group = device_group.create_group("analog_data")
         analog_limits_group = device_group.create_group("analog_limits")
         waits_group = device_group.create_group("waits")
+        wait_times_group = device_group.create_group("wait_times")
 
         # FIXME: inefficient/unclear to have to reprocess the data structure here
         for i, wait in enumerate(self.waits):
@@ -309,6 +320,10 @@ class FPGADevice(PseudoclockDevice):
             dtype = [(wait.keys()[i], type(wait.values()[i])) for i in range(4)]
             wait = np.array(tuple(wait.values()), dtype=dtype)
             waits_group.create_dataset("wait{}".format(i), data=wait, compression=config.compression)
+
+        for i, wait in enumerate(self.wait_times):
+            wait_times = np.array(self.wait_times, dtype=float)
+            wait_times_group.create_dataset("wait_times", data=wait_times, compression=config.compression)
 
         for i, pseudoclock in enumerate(self.pseudoclocks):
             output = self.output_devices[i].output
@@ -321,19 +336,23 @@ class FPGADevice(PseudoclockDevice):
             pseudoclock.clock = reduce_clock_instructions(pseudoclock.clock)  # , self.clock_resolution)
 
             # for digital outs, change from period/reps system to clocks/toggles (see function for explanation)
-            if isinstance(output, DigitalOut):
+            if isinstance(output, FPGADigitalOut):
                 pseudoclock.clock = convert_to_clocks_and_toggles(pseudoclock.clock, output, self.clock_limit)  # , self.clock_resolution)
                 clock_dtype = [('n_clocks', int), ('toggles', int)]
             else:
                 # for other outputs (analog) we just use the period/reps form.
 
                 # pack values into a data structure from which we can initialize an np array directly
-                pseudoclock.clock = [tuple(tick.values()) for tick in pseudoclock.clock]
+                pseudoclock.clock = process_analog_clock(pseudoclock.clock, self.clock_limit)
                 clock_dtype = [('period', int), ('reps', int)]
 
             if len(pseudoclock.clock) > self.max_clock_instructions:
                 raise LabscriptError("Cannot exceed more than {} clock"
                                      "instructions per channel ({} requested)".format(self.max_clock_instructions, len(pseudoclock.clock)))
+            # FIXME: ensure this is robust
+            # labscript will give a clocking signal/data (length 2) even if we have no instructions, so ignore these.
+            elif len(pseudoclock.clock) == 2:
+                continue
 
             clock = np.array(pseudoclock.clock, dtype=clock_dtype)
 
@@ -349,6 +368,9 @@ class FPGADevice(PseudoclockDevice):
                 if len(output.raw_output) > self.max_analog_data:
                     raise LabscriptError("Cannot exceed more than {} analog data"
                                          "points per channel ({} requested)".format(self.max_analog_data, len(output.raw_output)))
+                # labscript gives zero data even if no instructions specified, so ignore these
+                elif not any(output.raw_output):
+                    continue
                 else:
                     analog_data_group.create_dataset(output_connection,
                                                      data=output.raw_output,
@@ -364,9 +386,9 @@ class FPGADevice(PseudoclockDevice):
                     # no limits specified
                     pass
 
-            device_group.attrs['stop_time'] = self.stop_time
-            device_group.attrs['clock_limit'] = self.clock_limit
-            device_group.attrs['clock_resolution'] = self.clock_resolution
+        device_group.attrs['stop_time'] = self.stop_time
+        device_group.attrs['clock_limit'] = self.clock_limit
+        device_group.attrs['clock_resolution'] = self.clock_resolution
 
 
 class OutputIntermediateDevice(IntermediateDevice):
@@ -441,8 +463,12 @@ class FPGADeviceTab(DeviceTab):
         initial_values = self.get_front_panel_values()
         # pass initial front panel values to worker for manual programming cache
 
-        self.create_worker("main_worker", FPGADeviceWorker, {'initial_values': initial_values, 'analog_properties': self.analog_properties, 
-                            'digital_properties': self.digital_properties})
+        self.create_worker("main_worker", FPGADeviceWorker, {
+                           'initial_values': initial_values,
+                                'analog_properties': self.analog_properties,
+                                'digital_properties': self.digital_properties
+                            }
+                          )
         self.primary_worker = "main_worker"
 
         # FIXME: instatiate this worker only if we have waits
@@ -528,7 +554,7 @@ class FPGADeviceWorker(Worker):
         # processes and won't be cleanly restarted when the subprocess is restarted."
         from labscript_devices.fpga_api import FPGAInterface
 
-        self.interface = FPGAInterface(0x0403, 0x6001)
+        self.interface = FPGAInterface() #0x0403, 0x6001)
 
         # define these aliases so that the DeviceTab class can see them
         self.start = self.interface.start
@@ -566,7 +592,9 @@ class FPGADeviceWorker(Worker):
                 # send_realtime_value returns the actual value the board is now outputting
                 # so we can update the front panel to accurately reflect this
                 # FIXME: remove hardcoded range values
-                new_value = self.interface.send_realtime_value(int(board_number), int(channel_number), value, 0, 10, output_type)
+                logger.debug("sending realtime value: board_number={}, channel_number={}, "
+                             "value={}, range_min={}, range_max={}, output_type={}".format(board_number, channel_number, value, 0, 5, output_type))
+                new_value = self.interface.send_realtime_value(int(board_number), int(channel_number), value, 0, 5, output_type)
                 modified_values[output_name] = new_value
                 self.smart_cache['output_values'][output_name] = new_value
 
@@ -583,9 +611,19 @@ class FPGADeviceWorker(Worker):
             analog_data = device_group['analog_data']
             limits = device_group['analog_limits']
             waits = device_group['waits']
+            wait_times = device_group['wait_times']
+
+            clock_limit = device_group.attrs['clock_limit']
+            stop_time = device_group.attrs['stop_time']
 
             # value of each output at end of shot
             final_state = {}
+
+            # send repeats/period
+            # FIXME: remove hardcoded repeat
+            logger.debug("sending shot period/reps: shot_reps=2, shot_period={},".format(int(5 * stop_time * clock_limit)))
+            #self.interface.send_repeats_and_period(shot_reps=1, shot_period=int(stop_time * clock_limit))
+            self.interface.send_repeats_and_period(shot_reps=2, shot_period=int(5 * stop_time * clock_limit))
 
             # send the pseudoclocks
             for i, output in enumerate(clocks):
@@ -595,8 +633,9 @@ class FPGADeviceWorker(Worker):
                     self.smart_cache['clocks'][output] = clock
 
                     #board_number = clocks[output].attrs['board_number']
-                    
+
                     output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output)
+                    logger.debug("sending pseudoclock: board_number={}, channel_number={}, clock={}".format(int(board_number), int(channel_number), clock))
                     self.interface.send_pseudoclock(int(board_number), int(channel_number), clock=clock)
 
                 # if there is no entry for this output in the analog data group, it must be a digital out
@@ -620,13 +659,25 @@ class FPGADeviceWorker(Worker):
                         range_min, range_max = 0, 5
                     #board_number = clocks[output].attrs['board_number']
                     output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output)
+                    logger.debug("sending analog_data: board_number={}, channel_number={}, range_min={}, range_max={}, data={}".format(
+                        int(board_number), int(channel_number), range_min, range_max, data))
                     self.interface.send_analog_data(int(board_number), int(channel_number),
                                                     range_min=range_min, range_max=range_max, data=data)
-            
+
             # send the waits
             for i, wait in enumerate(waits):
                 wait = waits[wait].value
-                self.interface.send_wait(wait['board_number'], wait['channel_number'], wait['value'], wait['comparison'])
+                logger.debug("sending wait info: board_number={}, channel_number={}, value={}, comparison={}".format(
+                             wait['board_number'], wait['channel_number'], wait['value'], wait['comparison']))
+                self.interface.send_wait_info(wait['board_number'], wait['channel_number'], wait['value'], wait['comparison'])
+
+            # send wait times
+            try:
+                logger.debug("sending wait times: wait_times={}".format(wait_times['wait_times'].value))
+                self.interface.send_wait_times(wait_times['wait_times'].value)
+            except KeyError:
+                # no wait times
+                pass
 
         return final_state
 
