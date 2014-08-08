@@ -38,10 +38,12 @@ logger = logging.getLogger("main")
 # analog0.ramp(0, duration=3, initial=0, final=1, samplerate=1e4)
 # stop(1)
 
+
 class OutputConnectionName(str):
     """The BLACS DeviceTab only has access to the connection table
     and not to instances of the Devices themselves. This class allows
-    useful metadata to be encoded in/decoded from the connection string."""
+    useful metadata to be encoded in/decoded from the connection string.
+    File under: Elegant Hacks"""
 
     def __new__(self, type_=None, board_num=None, channel_num=None, group_name=None):
         name = "{}_{}_{}_{}".format(type_, board_num, channel_num, group_name)
@@ -67,6 +69,9 @@ class OutputConnectionName(str):
 
 
 def process_analog_clock(clock, clock_limit):
+    # throw away last instruction, junk
+    clock = clock[:-1]
+
     processed_clock = []
     for i, tick in enumerate(clock):
         # max update rate of DACs is ~1000 * the fundamental frequency, don't allow faster updates
@@ -74,7 +79,22 @@ def process_analog_clock(clock, clock_limit):
         if tick['step'] * clock_limit < 1000:
             print "Requested update rate exceeds that of the DACs ({}), discarding".format(tick['step'])
         else:
-            processed_clock.append((tick['step'] * clock_limit, tick['reps']))
+            instr = (int(round(tick['step'] * clock_limit) / 2.0)- 1, tick['reps']- 1)
+            processed_clock.append(instr)
+
+            # combine consecutive instructions with same period
+            """
+            if i > 0:
+                if instr[0] == processed_clock[-1][0]:
+                    prev_instr = list(processed_clock.pop())
+                    prev_instr[1] += instr[1]
+                    processed_clock.append(tuple(prev_instr))
+                else:
+                    processed_clock.append(instr)
+            else:
+                processed_clock.append(instr)
+            """
+    print processed_clock
     return processed_clock
 
 
@@ -114,15 +134,18 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
 
     ct_clock = []
 
-    for i, tick in enumerate(clock):
+    # FIXME: ensure this always holds
+    # throw away last instruction, always seems to be junk
+    clock = clock[:-1]
 
+    for i, tick in enumerate(clock):
         # the first (toggles)/(clocks) has a special meaning,
         # which specifies (the inital state)/(# clocks to hold it for)
         # NB. n_clocks=n => wait n-1 clock cycles before toggling
         if i == 0:
             initial_state = output.raw_output[0]
 
-            n_clocks = int(tick['step'] * clock_limit) - 1
+            n_clocks = int(round(tick['step'] * clock_limit)) - 1
             ct_clock.append((n_clocks, initial_state))
             tick['reps'] -= 1  # have essentially dealt with 1 rep above
 
@@ -133,11 +156,26 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
         # period = int(round(tick['step'] / clock_resolution) * clock_resolution)
 
         # subtract 1 due to auto toggling
-        # FIXME: ensure this is valid at every step, might just be required after first instruction?
         toggles = tick['reps'] - 1
-        n_clocks = int(tick['step'] * clock_limit) - 1
+        n_clocks = int(round(tick['step'] * clock_limit)) - 1
+
+        # combine consecutive instructions with same number of clocks
+        if i > 1:
+            if n_clocks == ct_clock[-1][0]:
+                prev_instr = list(ct_clock.pop())
+                combined_instr = (n_clocks, prev_instr[1] + toggles + 1)
+                ct_clock.append(combined_instr)
+                continue
 
         ct_clock.append((n_clocks, toggles))
+
+    # remove 1 from last toggles so we don't have an auto toggle at end of shot
+    # FIXME: what if we have a zero in last instruction ?
+    # check that the toggles of the last clock is not 0
+    if ct_clock[-1][1] != 0:
+        last_instr = list(ct_clock.pop())
+        last_instr[1] -= 1
+        ct_clock.append(tuple(last_instr))
 
     return ct_clock
 
@@ -208,7 +246,7 @@ class FPGADigitalOut(DigitalOut):
 @labscript_device
 class FPGADevice(PseudoclockDevice):
     """ A device with indiviually pseudoclocked outputs. """
-    max_clock_instructions = 256  # max number of pairs of p/r or c/t per channel
+    max_clock_instructions = 255  # max number of pairs of p/r or c/t per channel
     max_analog_data = 2**16 - 1  # max number of words for the analog channels
 
     clock_limit = 30e6  # 30 MHz
@@ -349,10 +387,11 @@ class FPGADevice(PseudoclockDevice):
             if len(pseudoclock.clock) > self.max_clock_instructions:
                 raise LabscriptError("Cannot exceed more than {} clock"
                                      "instructions per channel ({} requested)".format(self.max_clock_instructions, len(pseudoclock.clock)))
-            # FIXME: ensure this is robust
-            # labscript will give a clocking signal/data (length 2) even if we have no instructions, so ignore these.
-            elif len(pseudoclock.clock) == 2:
-                continue
+
+            # FIXME: find a proper way to deal with ghost instructions generated by labscript even when none specified
+            #elif len(pseudoclock.clock) == 2:
+            #    print pseudoclock.clock
+            #    continue
 
             clock = np.array(pseudoclock.clock, dtype=clock_dtype)
 
@@ -372,6 +411,16 @@ class FPGADevice(PseudoclockDevice):
                 elif not any(output.raw_output):
                     continue
                 else:
+                    # FIXME:
+                    #output.raw_output = np.append(output.raw_output, [output.raw_output[-1]] * (len(clock)))
+                    try:
+                        n_reps = sum(clock['reps'])
+                    except KeyError:
+                        pass
+
+                    print "n data points: {}, sum(reps): {}, sum(reps)+n_instructions: {}".format(
+                            len(output.raw_output), n_reps, n_reps + len(clock))
+
                     analog_data_group.create_dataset(output_connection,
                                                      data=output.raw_output,
                                                      compression=config.compression)
@@ -552,10 +601,14 @@ class FPGADeviceWorker(Worker):
     def init(self):
         # do imports here otherwwise "they will be imported in both the parent and child
         # processes and won't be cleanly restarted when the subprocess is restarted."
-        from labscript_devices.fpga_api import FPGAInterface
+        from labscript_devices.fpga_api import FPGAInterface, FTDIError
 
-        self.interface = FPGAInterface() #0x0403, 0x6001)
-
+        # FIXME: remove this try/except
+        try:
+            self.interface = FPGAInterface()
+        except FTDIError:
+            self.interface = FPGAInterface(0x0403, 0x6001)
+            
         # define these aliases so that the DeviceTab class can see them
         self.start = self.interface.start
         self.stop = self.interface.stop
@@ -598,6 +651,7 @@ class FPGADeviceWorker(Worker):
                 modified_values[output_name] = new_value
                 self.smart_cache['output_values'][output_name] = new_value
 
+        print modified_values
         return modified_values
 
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh_program):
@@ -621,25 +675,29 @@ class FPGADeviceWorker(Worker):
 
             # send repeats/period
             # FIXME: remove hardcoded repeat
-            logger.debug("sending shot period/reps: shot_reps=2, shot_period={},".format(int(5 * stop_time * clock_limit)))
-            #self.interface.send_repeats_and_period(shot_reps=1, shot_period=int(stop_time * clock_limit))
-            self.interface.send_repeats_and_period(shot_reps=2, shot_period=int(5 * stop_time * clock_limit))
+            #shot_period = 2 * sum([(tick['reps']+1)*(tick['period']+1) for tick in clocks[clocks.keys()[0]]])
+            shot_period = 0
+            print "Stop time: {}, Clock limit: {}".format(stop_time, clock_limit)
+            alt_shot_period = stop_time * clock_limit
+            shot_reps = 2
+            logger.debug("sending shot period/reps: shot_reps={}, shot_period={}, alt_shot_period={}".format(shot_reps, shot_period, alt_shot_period))
+            self.interface.send_repeats_and_period(shot_reps=shot_reps, shot_period=int(shot_period))
 
             # send the pseudoclocks
             for i, output in enumerate(clocks):
                 clock = clocks[output].value
                 # only send if it has changed or fresh program is requested
+                output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output)
+
                 if fresh_program or np.any(clock != self.smart_cache['clocks'].get(output)):
                     self.smart_cache['clocks'][output] = clock
 
                     #board_number = clocks[output].attrs['board_number']
 
-                    output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output)
                     logger.debug("sending pseudoclock: board_number={}, channel_number={}, clock={}".format(int(board_number), int(channel_number), clock))
                     self.interface.send_pseudoclock(int(board_number), int(channel_number), clock=clock)
 
-                # if there is no entry for this output in the analog data group, it must be a digital out
-                if not analog_data.get(output):
+                if output_type == "digital":
                     # then determine what the final state of the digital out is (initial state + n_toggles mod 2)
                     # FIXME: check this is right - might be off by 1!
                     n_toggles = sum(clock['toggles'])

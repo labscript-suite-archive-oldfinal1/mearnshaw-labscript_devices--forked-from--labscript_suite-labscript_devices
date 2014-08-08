@@ -19,6 +19,7 @@ logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
 import ftdi1 as ftdi
+import time
 
 buffered = False
 
@@ -49,6 +50,9 @@ def quantize_analog_value(value, range_min, range_max):
     step = (range_max - range_min) / (2.0**16 - 1)
     DAC_data = int(round((value - range_min) / step))
     quantized = DAC_data * step
+    # FIXME: remove
+    if DAC_data > (2.0**16 - 1):
+        raise FTDIError
     return quantized, DAC_data
 
 
@@ -60,7 +64,6 @@ def error_check(fn):
     """ decorator to check for and handle FTDI errors """
     def checked(*args):
         ret_val = fn(*args)  # libftdi python bindings don't accept kwargs
-
         # some functions return a tuple with the return code as its first value
         try:
             ft_status = ret_val[0]
@@ -70,8 +73,8 @@ def error_check(fn):
         # error values are negative (FIXME: or a null pointer, can we reliably test for that? None might be returned legitimately.)
         if ft_status < 0:
             try:
-                # assume the context is the first argument (...not aware of a counterexample)
                 err_msg = "An FTDI error occurred while calling '{}'".format(fn.__name__)
+                # assume the context is the first argument (...not aware of a counterexample)
                 context = args[0]
                 ftdi_err_msg = ftdi.get_error_string(context)
                 raise FTDIError("{}: {}".format(err_msg, ftdi_err_msg))
@@ -137,6 +140,7 @@ class FPGAInterface:
         ftdi.set_bitmode(self.c, 0xFF, ftdi.BITMODE_RESET)
         ftdi.usb_purge_buffers(self.c)
         ftdi.set_bitmode(self.c, 0xFF, bitmode)
+        ftdi.write_data_set_chunksize(self.c, 32)
 
     def close(self):
         # close device and free context
@@ -173,7 +177,7 @@ class FPGAInterface:
 
     def check_status(self):
         """ Read a byte from device and interpret it as a status code."""
-        status = self.receive_bytes(n_bytes=1)
+        status = self.receive_bytes(n_bytes=100)
         if status == FPGAStates.shot_finished:
             return "Finished (Code: {}).".format(status)
         else:
@@ -201,6 +205,8 @@ class FPGAInterface:
         """ Send pseudoclock to a given channel on a given board. """
         # send identifier (1 byte)
         self.send_value(FPGAModes.pseudoclock, n_bytes=1)
+        # 10us delay
+        time.sleep(10/1000000.0)
         # send board number (1 byte)
         self.send_value(board_number, n_bytes=1)
         # send channel number (1 byte)
