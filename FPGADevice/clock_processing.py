@@ -102,7 +102,8 @@ def convert_to_clocks_and_toggles(clock, output, clock_limit):
     # remove 1 from last toggles so we don't have an auto toggle at end of shot
     # FIXME: what if we have a zero in last instruction ?
     # check that the toggles of the last clock is not 0
-    if ct_clock[-1][1] != 0:
+    # and that we have more than one instruction (don't want to change the toggles of first instr.)
+    if (ct_clock[-1][1] != 0) and (len(ct_clock) > 1):
         last_instr = list(ct_clock.pop())
         last_instr[1] -= 1
         ct_clock.append(tuple(last_instr))

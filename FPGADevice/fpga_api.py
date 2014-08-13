@@ -23,6 +23,12 @@ import time
 
 buffered = True
 
+clocks_chunksize = 32
+clocks_delay = 0.01
+
+data_chunksize = 4
+data_delay = 0.01
+
 
 def value_to_bytes(i, length=None):
     """ Convert int to byte buffer, optionally padding or truncating to a specified length. """
@@ -154,7 +160,7 @@ class FPGAInterface:
         ftdi.set_bitmode(self.c, 0xFF, ftdi.BITMODE_RESET)
         ftdi.usb_purge_buffers(self.c)
         ftdi.set_bitmode(self.c, 0xFF, bitmode)
-        ftdi.write_data_set_chunksize(self.c, 16)
+        ftdi.write_data_set_chunksize(self.c, 2)
 
     def close(self):
         # close device and free context
@@ -182,27 +188,31 @@ class FPGAInterface:
 
             return n_bytes_written
 
-    def receive_bytes(self, n_bytes):
-        try:
-            return ftdi.read_data(self.c, n_bytes)
-        except TypeError:
-            # don't think there's any way out of this...
-            raise NotImplementedError("read_data is broken in this version of libftdi, please upgrade.")
-
     def check_status(self):
         """ Read a byte from device and interpret it as a status code."""
-        status = self.receive_bytes(n_bytes=100)
+        status = ftdi.read_data(self.c, 1)
         if status == FPGAStates.shot_finished:
             return "Finished (Code: {}).".format(status)
         else:
             return "Not finished (Code: {}).".format(status)
 
-    def send_buffer(self):
+    def send_buffer(self, chunksize=None, delay=None):
         """ send whatever is in the write_buffer to the device. """
         if self.write_buffer:
             byte_sequence = ''.join(self.write_buffer)
             self.write_buffer = []  # clear the buffer
-            return self.send_bytes(byte_sequence, buffered=False)
+
+            if chunksize is not None:
+                ftdi.write_data_set_chunksize(self.c, chunksize)
+                n_chunks = int(round(len(byte_sequence) / float(chunksize))) + 1
+                for i in range(n_chunks):
+                    sub_seq = byte_sequence[i * chunksize:(i + 1) * chunksize]
+                    if sub_seq:
+                        self.send_bytes(sub_seq, buffered=False)
+                        if delay is not None:
+                            time.sleep(delay)
+            else:
+                return self.send_bytes(byte_sequence, buffered=False)
 
     def send_value(self, value, n_bytes=None, buffered=buffered):
         """ Send value, optionally coercing to a fit specified number of bytes.
@@ -225,7 +235,7 @@ class FPGAInterface:
         self.send_value(channel_number, n_bytes=1)
 
         # 10us delay
-        time.sleep(10/1000000.0)
+        time.sleep(10 / 1000000.0)
 
         n_words = len(clock)  # takes 1 word (4 bytes) to send #clocks, and 1 to send toggles
         # send number of words (1 byte)
@@ -237,7 +247,7 @@ class FPGAInterface:
             self.send_value(tick[0], n_bytes=4)
 
         # submit bufferred values
-        #self.send_buffer()
+        # self.send_buffer(clocks_chunksize, clocks_delay)
 
     # FIXME: clarify this logic!
     def send_wait_info(self, board_number, channel_number, value, comparison):
@@ -296,7 +306,7 @@ class FPGAInterface:
             self.send_value(DAC_data, n_bytes=2)
             address += 1  # FIXME: how to deal with/specify addresses?
 
-        #self.send_buffer()
+        # self.send_buffer(data_chunksize, data_delay)
 
     def send_realtime_value(self, board_number, channel_number, value, range_min, range_max, output_type):
         """ Send value to an output in real-time.
@@ -357,6 +367,7 @@ class FPGAInterface:
     def start(self):
         """Trigger a shot."""
         try:
+            ftdi.usb_purge_rx_buffer(self.c)
             self.send_value(FPGAModes.trigger, n_bytes=1)
             self.send_buffer()
         except FTDIError as err:
@@ -370,6 +381,7 @@ class FPGAInterface:
     def reset(self):
         """Reset board."""
         logging.info("Resetting chip.")
+        self.send_value(FPGAModes.reset, n_bytes=1)
         ftdi.set_bitmode(self.c, 0xFF, ftdi.BITMODE_RESET)
         ftdi.usb_reset(self.c)
         ftdi.usb_purge_buffers(self.c)

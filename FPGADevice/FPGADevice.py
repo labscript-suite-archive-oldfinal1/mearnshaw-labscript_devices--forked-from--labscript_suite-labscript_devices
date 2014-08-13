@@ -29,6 +29,12 @@ import logging
 import functools
 import re
 
+clocks_chunksize = 256
+clocks_delay = 0.01
+
+data_chunksize = 4
+data_delay = None #0.005
+
 logger = logging.getLogger("main")
 
 # Example
@@ -71,7 +77,7 @@ class FPGADevice(PseudoclockDevice):
         self.n_digital = n_digital
 
         self.analog_channel_numbers = set(range(8))  # 0-7
-        self.digital_channel_numbers = set(range(8, 28))  # 8-27
+        self.digital_channel_numbers = set(range(8, 34))  # 8-33
 
         self.pseudoclocks = []
         self.clocklines = []
@@ -137,13 +143,13 @@ class FPGADevice(PseudoclockDevice):
         n_analog = outputs.count(FPGAAnalogOut)
         n_digital = outputs.count(FPGADigitalOut)
 
+        """
         # expected number not specified => whatever we have is correct
         if not self.n_digital:
             self.n_digital = n_digital
         if not self.n_analog:
             self.n_analog = n_analog
 
-        """
         if (self.n_analog != n_analog) or (self.n_digital != n_digital):
             raise LabscriptError("FPGADevice '{}' does not have enough outputs attached. "
                                  "Expected {} digital, {} analog but found {} digital, {} analog".format(self.name,
@@ -151,13 +157,14 @@ class FPGADevice(PseudoclockDevice):
                                                                                                          n_digital, n_analog))
         """
         
-        # create constant outputs on unused channels
-        # FIXME: remove hardcoded board number
-        for n in self.analog_channel_numbers.difference(used_channels):
-            FPGAAnalogOut("_analog_placeholder{}".format(n), self.outputs, board_number=1, channel_number=n, group_name="placeholder")
+        if self.n_digital or self.n_analog:
+            # create constant outputs on unused channels
+            # FIXME: remove hardcoded board number
+            for n in self.analog_channel_numbers.difference(used_channels):
+                FPGAAnalogOut("_analog_placeholder{}".format(n), self.outputs, board_number=1, channel_number=n, group_name="placeholder")
 
-        for n in self.digital_channel_numbers.difference(used_channels):
-            FPGADigitalOut("_digital_placeholder{}".format(n), self.outputs, board_number=1, channel_number=n, group_name="placeholder")
+            for n in self.digital_channel_numbers.difference(used_channels):
+                FPGADigitalOut("_digital_placeholder{}".format(n), self.outputs, board_number=1, channel_number=n, group_name="placeholder")
 
         PseudoclockDevice.generate_code(self, hdf5_file)
 
@@ -290,6 +297,7 @@ class FPGADeviceTab(DeviceTab):
 
             output_type = OutputConnectionName.output_type(conn_name)
             if output_type == "analog":
+                # FIXME: make sure this min/max works when limits specified in script
                 self.analog_properties[name] = {'conn_name': conn_name,
                                                 'base_unit': self.base_units,
                                                 'min': 0.0, 'max': 5.0, 'step': 0.1, 'decimals': 3}
@@ -570,6 +578,9 @@ class FPGADeviceWorker(Worker):
                     n_toggles = sum(clock['toggles'])
                     final_state[output_name] = clock[0]['toggles'] + (n_toggles % 2)
 
+            # FIXME: remove
+            self.interface.send_buffer(clocks_chunksize, clocks_delay)
+
             # send the analog data
             for i, output in enumerate(analog_data):
 
@@ -606,6 +617,9 @@ class FPGADeviceWorker(Worker):
                     logger.debug("i.send_analog_data(board_number={}, channel_number={}, "
                                  "range_min={}, range_max={}, data={})".format(board_number, channel_number, range_min, range_max, data))
                     self.interface.send_analog_data(board_number, channel_number, range_min, range_max, data)
+
+            # FIXME: remove
+            self.interface.send_buffer(data_chunksize, data_delay)
 
             # send the waits
             for i, wait in enumerate(waits):
