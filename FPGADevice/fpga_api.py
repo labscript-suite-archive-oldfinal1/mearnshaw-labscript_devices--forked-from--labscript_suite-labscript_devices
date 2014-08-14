@@ -1,82 +1,31 @@
 """
-    API to communicate with FPGA over USB using defined protocol
-    Requires libftdi.
+API to communicate with FPGA over USB using defined protocol
+Requires libftdi.
 """
 
-import struct
+import time
 import inspect
 import logging
 
+import ftdi1 as ftdi
+
 from labscript_devices.FPGADevice.fpga_wait import FPGAWait
+from labscript_devices.FPGADevice.util import value_to_bytes, quantize_analog_value
 
 logger = logging.getLogger('main')
 logger.setLevel(logging.DEBUG)
-file_handler = logging.FileHandler('/home/matt/sequence.log')
+file_handler = logging.FileHandler('~/sequence.log')
 file_handler.setLevel(logging.DEBUG)
 stream_handler = logging.StreamHandler()
 stream_handler.setLevel(logging.DEBUG)
 logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
-import ftdi1 as ftdi
-import time
-
+# buffered=False will send instructions in individual packets
+# ie. each clock period/reps will be sent as 2 bytes each. this is slow.
+# buffered=True will send the entire shot in one go according to
+# the chunksizes/delays specified in FPGADevice.py (default chunksize=256 if None specified)
 buffered = True
-
-clocks_chunksize = 32
-clocks_delay = 0.01
-
-data_chunksize = 4
-data_delay = 0.01
-
-
-def value_to_bytes(i, length=None):
-    """ Convert int to byte buffer, optionally padding or truncating to a specified length. """
-    bytes_ = []
-    while i > 0:
-        n = i % 256
-        bytes_.insert(0, n)
-        i >>= 8
-
-    if length is not None:
-        diff = length - len(bytes_)
-
-        if diff >= 0:
-            # pad
-            bytes_[:0] = [0] * diff
-        else:
-            # truncate
-            bytes_ = bytes_[:length]
-
-    return ''.join(struct.pack('B', x) for x in bytes_)
-
-
-def quantize_analog_value(value, range_min, range_max):
-    """ DAC output specified by 16 bits with 0x0000 set to the
-    minimum of the range, 0xFFFF the maximum of the range (6 ranges
-    are possible with our LTC1592 DACs).
-
-    Returns value to be packed in the 16-bit data word to specify
-    the desired output given the currently programmed range, and
-    the quantized value it represents. """
-
-    step = (range_max - range_min) / (2.0**16 - 1)
-    # deal with extreme values first
-    if value > range_max:
-        return int(2.0**16 - 1), int(step * (2.0**16 - 1))
-    elif value < range_min:
-        return 0, 0
-    else:
-        try:
-            DAC_data = int(round((value - range_min) / step))
-        except ValueError:
-            return 0, 0
-        quantized = round(value / step) * step
-        return quantized, DAC_data
-
-
-class FTDIError(Exception):
-    pass
 
 
 def error_check(fn):
@@ -114,6 +63,10 @@ for member in ftdi_members:
         vars(ftdi)[name] = error_check(fn)
 
 
+class FTDIError(Exception):
+    pass
+
+
 class FPGAModes:
     """Mode identifiers."""
     realtime = 0
@@ -147,20 +100,18 @@ class FPGAInterface:
         # open first device with the supplied VID:PID
         ftdi.usb_open(self.c, self.vendor_id, self.product_id)
 
-        self.init_chip(bitmode=ftdi.BITMODE_SYNCFF)
+        ftdi.set_latency_timer(self.c, 2)
+        # enter 245 synchronous FIFO mode with all bits set as outputs (0xFF)
+        # assumes external EEPROM is set to 245 FIFO mode
+        ftdi.set_bitmode(self.c, 0xFF, ftdi.BITMODE_RESET)
+        ftdi.usb_purge_buffers(self.c)
+        ftdi.set_bitmode(self.c, 0xFF, ftdi.BITMODE_SYNCFF)
+
+        ftdi.write_data_set_chunksize(self.c, 256)
 
         # more efficient to send as much data as possible in a single write,
         # see FTDI Technical Note TN_103 for more info, hence write_buffer
         self.write_buffer = []
-
-    def init_chip(self, bitmode):
-        # enter 245 synchronous FIFO mode with all bits set as outputs (0xFF)
-        # assumes external EEPROM is set to 245 FIFO mode
-        ftdi.set_latency_timer(self.c, 2)
-        ftdi.set_bitmode(self.c, 0xFF, ftdi.BITMODE_RESET)
-        ftdi.usb_purge_buffers(self.c)
-        ftdi.set_bitmode(self.c, 0xFF, bitmode)
-        ftdi.write_data_set_chunksize(self.c, 2)
 
     def close(self):
         # close device and free context
@@ -172,12 +123,11 @@ class FPGAInterface:
         self.close()
 
     def send_bytes(self, bytes_, buffered=buffered):
-        """ write a sequence of byte(s) to device.
-            If buffered (default True) then value will be not be written until send_buffer is called. """
+        """write a sequence of byte(s) to device.
+            If buffered (default True) then value will be not be written until send_buffer is called."""
 
         if buffered:
             self.write_buffer.append(bytes_)
-            #logging.debug("buffered {} bytes: {}".format(len(bytes_), repr(bytes_)))
         else:
             self.send_buffer()  # send any currently buffered data so order is maintained
             logger.debug("writing {} bytes: {}".format(len(bytes_), repr(bytes_)))
@@ -189,15 +139,12 @@ class FPGAInterface:
             return n_bytes_written
 
     def check_status(self):
-        """ Read a byte from device and interpret it as a status code."""
+        """Read a byte from device."""
         status = ftdi.read_data(self.c, 1)
-        if status == FPGAStates.shot_finished:
-            return "Finished (Code: {}).".format(status)
-        else:
-            return "Not finished (Code: {}).".format(status)
+        return status
 
     def send_buffer(self, chunksize=None, delay=None):
-        """ send whatever is in the write_buffer to the device. """
+        """send whatever is in the write_buffer to the device."""
         if self.write_buffer:
             byte_sequence = ''.join(self.write_buffer)
             self.write_buffer = []  # clear the buffer
@@ -215,23 +162,19 @@ class FPGAInterface:
                 return self.send_bytes(byte_sequence, buffered=False)
 
     def send_value(self, value, n_bytes=None, buffered=buffered):
-        """ Send value, optionally coercing to a fit specified number of bytes.
-            If buffered (default True) then value will be not be written until send_buffer is called. """
+        """Send value, optionally coercing to a fit specified number of bytes.
+           If buffered (default True) then value will be not be written until send_buffer is called."""
         bytes_ = value_to_bytes(value, length=n_bytes)
         if buffered:
             self.write_buffer.append(bytes_)
-            #logging.debug("buffered {} bytes: {} ({})".format(len(bytes_), repr(bytes_), value))
         else:
             self.send_buffer()  # send any currently buffered data so order is maintained
             return self.send_bytes(bytes_, buffered=False)
 
     def send_pseudoclock(self, board_number, channel_number, clock):
-        """ Send pseudoclock to a given channel on a given board. """
-        # send identifier (1 byte)
+        """Send pseudoclock to a given channel on a given board."""
         self.send_value(FPGAModes.pseudoclock, n_bytes=1)
-        # send board number (1 byte)
         self.send_value(board_number, n_bytes=1)
-        # send channel number (1 byte)
         self.send_value(channel_number, n_bytes=1)
 
         # 10us delay
@@ -251,7 +194,6 @@ class FPGAInterface:
 
     # FIXME: clarify this logic!
     def send_wait_info(self, board_number, channel_number, value, comparison):
-
         # analog waits have comparison
         if comparison != FPGAWait.null_value:
             self.send_value(FPGAModes.analog_wait, n_bytes=1)
@@ -271,31 +213,25 @@ class FPGAInterface:
 
             self.send_value(channel_number, n_bytes=1)
             self.send_value(value, n_bytes=1)
- 
+
         #self.send_buffer()
 
     def send_wait_times(self, times):
         self.send_value(FPGAModes.wait_times, n_bytes=1)
-        for time in times:
-            self.send_value(int(time), n_bytes=8)
+        for time_ in times:
+            self.send_value(int(time_), n_bytes=8)
         #self.send_buffer()
 
     def send_analog_data(self, board_number, channel_number, range_min, range_max, data):
-        """ Send analog data to a given channel on a given board.
+        """Send analog data to a given channel on a given board.
+           range_min, range_max are the min/max output voltages configured on the DAC on this channel."""
 
-            range_min, range_max are the min/max output voltages configured on the DAC on this channel
-        """
-        # send identifier
         self.send_value(FPGAModes.data, n_bytes=1)
-        # send board number
         self.send_value(board_number, n_bytes=1)
-        # send channel number
         self.send_value(channel_number, n_bytes=1)
         n_words = len(data)  # address and data transmitted in a single word
-        # send number of words (NB. two bytes)
         self.send_value(n_words, n_bytes=2)
 
-        # send addressed data
         address = 0  # FIXME: how to deal with/specify addresses?
         for datum in data:
             # pack address into 2 bytes
@@ -304,21 +240,18 @@ class FPGAInterface:
             # pack quantized value into 2 bytes
             quantized_value, DAC_data = quantize_analog_value(datum, range_min, range_max)
             self.send_value(DAC_data, n_bytes=2)
-            address += 1  # FIXME: how to deal with/specify addresses?
+            address += 1
 
         # self.send_buffer(data_chunksize, data_delay)
 
     def send_realtime_value(self, board_number, channel_number, value, range_min, range_max, output_type):
-        """ Send value to an output in real-time.
-            output_type is either 'analog' or 'digital'.
+        """Send value to an output in real-time.
+           output_type is either 'analog' or 'digital'.
 
-            Returns the (possibly coerced/quantized) value sent to the board. """
+           Returns the (possibly coerced/quantized) value sent to the board."""
 
-        # send mode identifier
         self.send_value(FPGAModes.realtime, n_bytes=1)
-        # send board number
         self.send_value(board_number, n_bytes=1)
-        # send channel number
         self.send_value(channel_number, n_bytes=1)
 
         if output_type == "analog":
@@ -336,22 +269,15 @@ class FPGAInterface:
     def send_parameter(self, board_number, channel_number, value):
         """Update a parameter on an output."""
         # FIXME: need more info about the possible parameters etc.
-        # send mode identifier
         self.send_value(FPGAModes.parameter, n_bytes=1)
-        # send board number
         self.send_value(board_number, n_bytes=1)
-        # send channel number
         self.send_value(channel_number, n_bytes=1)
-        # send the parameter
         self.send_value(value, n_bytes=1)
         #self.send_buffer()
 
     def send_repeats_and_period(self, shot_reps, shot_period):
-        # send mode identifier
         self.send_value(FPGAModes.repeat, n_bytes=1)
-        # send shot reps (2 bytes)
         self.send_value(shot_reps, n_bytes=2)
-        # send shot period (8 bytes)
         self.send_value(shot_period, n_bytes=8)
         #self.send_buffer()
 
