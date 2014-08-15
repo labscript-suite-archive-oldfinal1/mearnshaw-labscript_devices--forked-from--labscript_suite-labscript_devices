@@ -175,7 +175,7 @@ FPGADigitalOut(name, parent_device, board_number, channel_number, group_name=Non
 \begin{minted}[bgcolor=bg,fontsize=\footnotesize]{python}
 from labscript_devices.FPGADevice import FPGADevice, FPGAAnalogOut, FPGADigitalOut
 
-# instantiate an FPGADevice bound to my_fpga, with 8 digital channels and 25 analog channels (default values)
+# instantiate an FPGADevice bound to my_fpga, with 8 digital channels and 25 analog channels (default)
 FPGADevice("my_fpga")
 
 # attach an analog out to board 0 (default), channel 1, constrained to -5 to 5 V
@@ -192,7 +192,7 @@ start()
 shutter.go_high(t=0)
 
 # see labscript API documentation for the full format of these commands
-red\_MOT.ramp(t=0, \ldots{})
+red_MOT.ramp(t=0, ...)
 stop(5)
 \end{minted}
 
