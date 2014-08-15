@@ -1,0 +1,317 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2cm]{geometry}
+\setlength{\parindent}{0pt}
+
+\usepackage{amsmath}
+\usepackage{float}
+\usepackage{minted}
+\usepackage{natbib}
+\usepackage{url}
+
+\usepackage{etoolbox}
+\BeforeBeginEnvironment{minted}{\vspace{3mm}}
+\AfterEndEnvironment{minted}{\vspace{3mm}}
+
+\usepackage{datetime}
+\newdateformat{mydate}{\monthname[\THEMONTH] \THEYEAR}
+
+\usepackage{color}
+\definecolor{bg}{rgb}{0.95,0.95,0.95}
+
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,urlcolor=blue,linktoc=all,linkcolor=black}
+
+\usepackage{fancyhdr}
+\usepackage[xetex]{graphicx}
+
+\usepackage{fontspec} % Allows font customization
+\defaultfontfeatures{Mapping=tex-text}
+\setmainfont{Adobe Garamond Pro} % Main document font
+
+\pagestyle{fancy}
+\fancyhead{}
+\setlength{\headheight}{15.2pt}
+\lhead{Labscript FPGA Documentation}
+\rhead{Matt Earnshaw}
+\chead{\mydate\today}
+\cfoot{\thepage}
+
+\begin{document}
+\title{Labscript FPGA Documentation}
+\author{Matt Earnshaw \\ \texttt{matt@earnshaw.org.uk}}
+\date{\mydate\today}
+\maketitle
+
+\tableofcontents 
+\newpage
+
+\section{Installation}
+The \href{https://bitbucket.org/labscript_suite/install-guide/src}{labscript install guide} is not recommended (as of August 2014). It is preferable to follow the method below which installs the various labscript suite modules automatically using the pip utility. This should work on Windows or Linux, however for ease of installing libftdi, Linux is the recommended platform.
+
+\subsection{Prerequisites}
+Install the following using your OS's package manager or otherwise. You may also need to install a FORTRAN compiler (eg. gcc-fortran) if you have issues installing NumPy/SciPy.
+
+\begin{itemize}
+\itemsep1pt\parskip0pt\parsep0pt
+\item \href{http://www.python.org}{Python 2.7}
+\item \href{https://pypi.python.org/pypi/pip}{python-pip}
+\item \href{http://www.intra2net.com/en/developer/libftdi/}{libftdi} (version 1.0+, aka libftdi1 - including python bindings)
+\item \href{http://www.intra2net.com/en/developer/libftdi/}{PyQt4}
+\item \href{http://www.scipy.org}{SciPy}
+\item \href{http://www.numpy.org}{NumPy}
+\end{itemize}
+
+%$ pip install h5py pyzmq==13.1.0 pyside pandas PyDAQmx spinapi qtutils zprocess
+
+\subsection{Installing labscript suite}
+Use pip to install the tarballs from my forks of the labscript suite repositories. pip should automatically resolve and install the extra dependencies. 
+
+\begin{minted}[bgcolor=bg,fontsize=\footnotesize]{bash}
+$ pip install https://bitbucket.org/mearnshaw/labscript_utils/get/1.1.0-dev.tar.gz
+$ pip install https://bitbucket.org/mearnshaw/labscript/get/gated-clocks.tar.gz
+$ pip install https://bitbucket.org/mearnshaw/labscript_devices/get/fpga-device.tar.gz
+$ pip install https://bitbucket.org/mearnshaw/blacs/get/1.1.0-dev.tar.gz
+$ pip install https://bitbucket.org/mearnshaw/runmanager/get/default.tar.gz
+$ pip install https://bitbucket.org/mearnshaw/runviewer/get/gated-clocks.tar.gz
+\end{minted}
+
+If any problems are encountered in the above, try manually installing the extra dependencies (see below), then retry the above.
+
+\begin{minted}[bgcolor=bg,fontsize=\footnotesize]{bash}
+$ pip install h5py pyzmq==13.1.0 pyside pandas PyDAQmx spinapi qtutils zprocess
+\end{minted}
+
+\subsection{Testing installation}
+In a Python shell run the following (for example - requires FPGA to be connected):
+
+\begin{minted}[bgcolor=bg,fontsize=\footnotesize]{python}
+>>> import labscript
+>>> from labscript_devices.FPGADevice import FPGADevice
+>>> from labscript_devices.FPGADevice.fpga_api import FPGAInterface
+>>> i = FPGAInterface()
+>>> i.start()
+\end{minted}
+
+no errors = success!
+
+\section{Setting up BLACS/runmanager}
+A configuration file is required before runmanager will talk to BLACS. On Windows this file should be in \texttt{C:\textbackslash{}labconfig\textbackslash{}}, and on Linux either in \texttt{/home/[user]/labconfig/}, or \texttt{/etc/labconfig/}. The name of the file should be \textless{}hostname\textgreater{}.ini where \textless{}hostname\textgreater{} is the hostname of the machine (under Linux this is the string returned by the hostname command, or \href{http://windows.microsoft.com/en-gb/windows/find-computer-name}{see this} for Windows). See below for an example configuration file.
+
+\begin{minted}[label=hostname.ini,bgcolor=bg,fontsize=\footnotesize]{ini}
+[DEFAULT]
+experiment_name = test
+
+[paths]
+shared_drive = /tmp/
+experiment_shot_storage = /home/matt
+labscriptlib = /
+connection_table_h5 = /home/matt/labconfig/connection_table.h5
+connection_table_py = /home/matt/labconfig/connection_table.py
+
+[programs]
+text_editor = vim
+text_editor_arguments =
+
+[ports]
+BLACS = 42517
+lyse = 42519
+mise = 42520
+zlock = 7339
+
+[servers]
+zlock = localhost
+\end{minted}
+
+The connection\_table fields are paths to files containing the
+experiment's connection table, which is everything in the labscript
+experiment before start(), ie. where the devices involved and their
+connections are specified. Example:
+
+\begin{minted}[label=connection\_table.py,bgcolor=bg,fontsize=\footnotesize]{python}
+# connection_table.py
+
+from labscript import *
+from labscript_devices.FPGADevice import FPGADevice, FPGAAnalogOut, FPGADigitalOut
+
+FPGADevice(name='my_fpga')
+
+FPGAAnalogOut('analog0', my_fpga.outputs, board_number=1, channel_number=0)
+FPGAAnalogOut('analog1', my_fpga.outputs, board_number=1, channel_number=1)
+FPGADigitalOut('digital1', my_fpga.outputs, board_number=1, channel_number=8)
+
+start()
+stop(1)
+\end{minted}
+
+Note that you must include a ``start(); stop(1)'' at the end so that runmanager will compile it. \\
+
+Compile your connection table with runmanager and move the resultant .h5 file to the path specified in the config file. This should only need to be done once
+as any subsequent time the connection table is change, BLACS will automatically detects the changes and will offer to recompile for you.
+
+\section{Using BLACS/runmanager}
+To start the programs simply run blacs/main.pyw and runmanager/main.pyw which can be found in your site-packages directory (typically /usr/lib/python2.7/site-packages). Refer to \href{http://labscriptsuite.org/docs/using_runmanager.pdf}{Using Runmanger} and \href{http://labscriptsuite.org/docs/Using_BLACS.pdf}{Using BLACS} for more details.
+
+\section{General overview of using the FPGADevice in labscript}
+The FPGADevice class (in labscript\_devices/FPGADevice/FPGADevice.py) represents one or more boards connected to the computer through a single USB connection. It can be used in the connection table as follows:
+
+\begin{minted}[bgcolor=bg,fontsize=\footnotesize]{python}
+from labscript_devices.FPGADevice import FPGADevice
+FPGADevice(name, n_analog=8, n_digital=25)
+\end{minted}
+
+If the parameters n\_analog, n\_digital are provided, then clocks/data will be generated for that many channels regardless of how many are specified in the connection table by generating default (zero) clocks/data on channels that are left unspecified. \\
+
+Labscript binds an instance of the device to the name provided in the first parameter as a string. Thus as with all labscript objects, the name must be a valid Python identifier (no spaces for example, see \href{http://labscriptsuite.org/docs/using_labscript.pdf}{Using the Labscript API} and the following for more info). \\
+
+FPGADevice instances have an \texttt{outputs} attribute which returns an \texttt{OutputIntermediateDevice} which should be specified as the parent device of any \texttt{Outputs}. The supported output types are \texttt{FPGAAnalogOut} and \texttt{FPGADigitalOut} (labscript\_devices/FPGADevice/fpga\_outputs.py). As these subclass labscript's \texttt{AnalogOut} and \texttt{DigitalOut}, all the same functions can be used on them (eg. constant, ramp, sine etc.).
+
+\begin{minted}[bgcolor=bg,fontsize=\footnotesize]{python}
+FPGAAnalogOut(name, parent_device, board_number, channel_number, group_name=None, limits=None)
+FPGADigitalOut(name, parent_device, board_number, channel_number, group_name=None)
+\end{minted}
+
+\texttt{limits} is is an optional parameter which if specified should be a tuple of the min,max values allowed on that output (see example). The other optional parameter \texttt{group\_name} is currently only used internally but could be used in the future to group outputs in the GUI, for example.
+
+\begin{minted}[bgcolor=bg,fontsize=\footnotesize]{python}
+from labscript_devices.FPGADevice import FPGADevice, FPGAAnalogOut, FPGADigitalOut
+
+# instantiate an FPGADevice bound to my_fpga, with 8 digital channels and 25 analog channels (default values)
+FPGADevice("my_fpga")
+
+# attach an analog out to board 0 (default), channel 1, constrained to -5 to 5 V
+# and bound to name: red_MOT
+FPGAAnalogOut("red_MOT", my_fpga.outputs, channel_number=1, limits=(-5,5))
+
+# attach a digital output to board 1, channel 2, bound to name: shutter
+FPGADigitalOut("shutter", my_fpga.outputs, board_number=1, channel_number=2)
+
+shot_reps = 2  # run the shot twice
+
+# do an experiment
+start()
+shutter.go_high(t=0)
+
+# see labscript API documentation for the full format of these commands
+red\_MOT.ramp(t=0, \ldots{})
+stop(5)
+\end{minted}
+
+\section{Waits}
+FPGADevice provides a wait method for producing global waits on the FPGA.
+
+\begin{minted}[bgcolor=bg,fontsize=\footnotesize]{python}
+wait(at_time, board_number=None, channel_number=None, value=None, comparison=None)
+\end{minted}
+
+There are 3 categories of wait classified according to the type of input
+controlling the wait: ``PC Wait'', ``Digital Wait'', ``Analog Wait''.
+The type of wait required is inferred from the parameters provided to
+wait. A ``PC Wait'' only requires the time at which it is to occur, a
+``Digital Wait'' requires the time, board number, channel number and
+value to wait on (True/False, 1/0), and an ``Analog Wait'' requires
+these and an additional comparison operator character (less than:
+`\textless{}', greater than: `\textgreater{}').
+
+\begin{minted}[bgcolor=bg,fontsize=\footnotesize]{python}
+FPGADevice("my_fpga")
+shot_reps = 4  # repeat the shot 4 times
+
+start()
+# analog wait
+my_fpga.wait(at_time=0, board_number=1, channel_number=2, value=5.2, comparison='<')
+# digital wait
+my_fpga.wait(at_time=1, board_number=1, channel_number=2, value=True)
+# PC wait
+my_fpga.wait(at_time=2)
+stop(10)
+\end{minted}
+
+\section{Shot Reps}
+The number of repetitions of the shot can be specified by including a shot\_reps variable in the script, as in the above examples. If unspecified the default shot repetitions is 1.
+
+\section{Implementation details}
+
+\subsection{FPGADevice.py}
+The FPGADevice class subclasses labscript's generic PseudoclockDevice class, which represents some Device with multiple pseudoclocks. 
+
+\subsubsection{Board configuration}
+The boards\_configuration attribute of FPGADevice is a dictionary mapping board numbers to dictionaries with the format
+
+\begin{minted}[bgcolor=bg,fontsize=\footnotesize]{python}
+{'analog': [analog_channel_numbers], 'digital': [digital_channel_numbers]}
+\end{minted}
+
+so when multiple boards are introduced this should be updated to reflect the new board/channel numbering structure.
+
+\subsubsection{H5 file generation}
+The generate\_code method of FPGADevice first creates placeholder outputs on any unconnected channels and then calls the generate\_code method of PseudoclockDevice which iterates through all the Pseudoclocks on the device and produces their clocking signals and data (pseudoclock.clock, output.raw\_output). FPGADevice takes these raw clocking signals (period in seconds which labscript calls `step', and repetitions or `reps') and processes them into a format understood by the FPGA (see section \ref{clockproc}), writing them to the H5 file.
+
+\subsubsection{Output connection name/output name}
+Each output has a name, which is provided as the first parameter - and a connection name which is automatically generated. util.py provides various functions to retrieve these names because BLACS needs to know how they correspond. 
+
+\subsubsection{Changing chunksize/delays}
+At the start of FPGADevice.py there are four variables that can be used to
+control the chunksize/delay between chunks (in seconds) for clocks/data.
+To remove the delay or to maximize the chunks, simply set the
+appropriate variables to None, which will let everything run as fast as
+possible (default chunksize=512, no delays)
+
+\subsection{clock\_processing.py}
+\label{clockproc}
+All of the raw signals produced by labscript (for both analog and
+digital channels) are first reduced by reduce\_clock\_instructions which
+simply combines compounds the reps of consecutive instructions with the
+same period (although due to rounding/floating point errors, some
+periods that should be the same actually differ by a small amount and so
+these can't be combined). \\
+
+For the analog channels the clock is then processed by the
+process\_analog\_clock function. This first discards the last clock
+instruction, which in all cases tested appears to be unnecessary junk.
+The formula for transforming the labscript period (seconds)/reps is then
+
+\begin{align}
+	\text{period}_{\text{FPGA}} &= \frac{1}{2} \text{round}(\text{period}_{\text{labscript}} \times \text{FPGA\_clock}) - 1 \\
+	\text{reps}_{\text{FPGA}} &= \text{reps}_{\text{labscript}} - 1
+\end{align}
+
+where FPGA\_clock is the fundamental frequency, 30 MHz. Any
+instructions for which labscript\_period * FPGA\_clock is less than
+1000 is discarded as the DACs cannot update this quickly. This behaviour
+should probably be improved. \\
+
+Digital channel clocks are processed by
+convert\_to\_clocks\_and\_toggles function. Again this discards the last
+instruction which is unneeded (in all tests to date). Clocks/toggles are
+calculated according to
+
+\begin{align}
+	\text{clocks}_{\text{FPGA}} &= \text{round}(\text{period}_{\text{labscript}} \times \text{FPGA\_clock}) - 1 \\
+	\text{toggles}_{\text{FPGA}} &= \text{reps}_{\text{labscript}} - 1
+\end{align}
+
+except for the first instruction where toggles is the initial state of
+the channel. If the first instruction in the labscript clock has more
+than 1 rep, we simply decrement the number of reps by 1 having created
+this special first instruction, and then proceed to process what remains
+according to the above formulae. Finally we subtract 1 from the toggles
+of the final instruction to compensate for the final autotoggle.
+
+\section{FPGADeviceWorker}
+
+FPGADeviceWorker is responsible for ultimately coordinating dispatching shots to the FPGA via BLACS. This is achieved via the FPGAInterface class (in fpga\_api.py) which has the methods for encoding the various parts of the shot (clocks, data, etc.) into the FPGA protocol.
+
+\section{Troubleshooting}
+
+\subsection{``Cannot connect more than n outputs to the device `fpga...'''}
+
+Ensure the correct number of outputs has been specified for the FPGA in the connection table and that it's the same in the shot file.
+
+eg. FPGADevice(name='fpga', n\_analog=8, n\_digital=25)
+
+\subsection{``The device name \ldots{} already exists in the Python namespace...''}
+Ensure all devices in the connection table have unique names.
+
+\section{Known Issues}
+\end{document}
+
