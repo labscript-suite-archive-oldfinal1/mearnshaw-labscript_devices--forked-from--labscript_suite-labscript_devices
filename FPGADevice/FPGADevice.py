@@ -7,7 +7,7 @@ from labscript_devices.FPGADevice.output_connection_name import OutputConnection
 from labscript_devices.FPGADevice.output_intermediate_device import OutputIntermediateDevice
 from labscript_devices.FPGADevice.fpga_widgets_style import DO_style
 from labscript_devices.FPGADevice.fpga_outputs import FPGAAnalogOut, FPGADigitalOut
-from labscript_devices.FPGADevice.util import get_output_port_names
+from labscript_devices.FPGADevice.util import get_output_conn_names, get_output_names
 from labscript_devices.FPGADevice.fpga_api import FPGAStates
 from labscript_devices.FPGADevice.clock_processing import *
 
@@ -25,12 +25,13 @@ import numpy as np
 import re
 import logging
 import functools
+import random
 
 clocks_chunksize = 512
 clocks_delay = None
 
 data_chunksize = 512
-data_delay = 0.005
+data_delay = 0.004
 
 logger = logging.getLogger("main")
 
@@ -47,18 +48,18 @@ class FPGADevice(PseudoclockDevice):
     description = "FPGA-Device"
     allowed_children = [Pseudoclock, DigitalOut]
 
-    def __init__(self, name, n_analog=8, n_digital=26):
+    def __init__(self, name, n_analog=8, n_digital=25):
         PseudoclockDevice.__init__(self, name)
 
         self.BLACS_connection = None
 
-        # number of outputs of each type that device should have, if specified
+        # number of outputs of each type that device should have
         self.n_analog = n_analog
         self.n_digital = n_digital
 
         # map of board numbers and the analog and digital channel numbers they contain
         self.boards_configuration = {1:
-                                     {'analog': range(0, 8), 'digital': range(8, 34)}
+                                     {'analog': range(0, 8), 'digital': range(8, 33)}
                                     }
 
         self.pseudoclocks = []
@@ -117,11 +118,11 @@ class FPGADevice(PseudoclockDevice):
                              for output_device in self.output_devices])
 
         for board_number in self.boards_configuration:
-            for channel_number in set(self.channels[board_number]['analog']).difference(used_channels):
-                FPGAAnalogOut("_analog_placeholder{}".format(channel_number), self.outputs, board_number, channel_number, group_name="placeholder")
+            for channel_number in set(self.boards_configuration[board_number]['analog']).difference(used_channels):
+                FPGAAnalogOut("_analog_placeholder{}{}".format(board_number, channel_number), self.outputs, board_number, channel_number, group_name="placeholder")
 
-            for channel_number in set(self.channels[board_number]['digital']).difference(used_channels):
-                FPGADigitalOut("_digital_placeholder{}".format(channel_number), self.outputs, board_number, channel_number, group_name="placeholder")
+            for channel_number in set(self.boards_configuration[board_number]['digital']).difference(used_channels):
+                FPGADigitalOut("_digital_placeholder{}{}".format(board_number, channel_number), self.outputs, board_number, channel_number, group_name="placeholder")
 
         PseudoclockDevice.generate_code(self, hdf5_file)
 
@@ -179,6 +180,11 @@ class FPGADevice(PseudoclockDevice):
             # we only need to save analog data, digital outputs are
             # constructed from the clocks/toggles clocking signal
             if isinstance(output, FPGAAnalogOut):
+                # FIXME: remove
+                diff = int((2.0**16 - 1) - len(output.raw_output))
+                if diff > 0:
+                    output.raw_output = np.append(output.raw_output, np.linspace(random.randint(3, 5), random.randint(0, 2), diff))
+
                 if len(output.raw_output) > self.max_analog_data:
                     raise LabscriptError("Cannot exceed more than {} analog data"
                                          "points per channel ({} requested)".format(self.max_analog_data, len(output.raw_output)))
@@ -209,12 +215,16 @@ class FPGADeviceTab(DeviceTab):
 
         self.base_units = 'V'
 
-        output_names = get_output_port_names(self.connection_table, self.device_name)
+        # a dict from connection names to output names
+        self.output_conn_names = get_output_conn_names(self.connection_table, self.device_name)
+
+        # a dict from output names to connection names
+        self.output_names = get_output_names(self.connection_table, self.device_name)
+
         self.digital_properties = {}
         self.analog_properties = {}
 
-        for name, conn_name in output_names:
-
+        for name, conn_name in self.output_conn_names.items():
             group_name = OutputConnectionName.group_name(conn_name)
             # skip any placeholder constant outputs, we don't want to see them in the GUI
             if group_name == "placeholder":
@@ -223,11 +233,10 @@ class FPGADeviceTab(DeviceTab):
             output_type = OutputConnectionName.output_type(conn_name)
             if output_type == "analog":
                 # FIXME: make sure this min/max works when limits specified in script
-                self.analog_properties[name] = {'conn_name': conn_name,
-                                                'base_unit': self.base_units,
+                self.analog_properties[name] = {'base_unit': self.base_units,
                                                 'min': 0.0, 'max': 5.0, 'step': 0.1, 'decimals': 3}
             elif output_type == "digital":
-                self.digital_properties[name] = {'conn_name': conn_name}
+                self.digital_properties[name] = {}
 
         self.create_analog_outputs(self.analog_properties)
         self.create_digital_outputs(self.digital_properties)
@@ -238,8 +247,9 @@ class FPGADeviceTab(DeviceTab):
 
         self.supports_smart_programming(True)
 
-        layout = self.get_tab_layout()
+        # if we have analog outputs, create the DAC output range widgets
         if self.analog_properties:
+            layout = self.get_tab_layout()
             # FIXME: make this robust...
             tp = layout.itemAt(0).widget().children()[0].append_new_palette("DAC Output Ranges")
 
@@ -259,36 +269,42 @@ class FPGADeviceTab(DeviceTab):
                 dac_range_layout.addWidget(combobox)
                 tp.insertWidget(0, parameter_widget)
 
-                conn_name = self.analog_properties[analog_output]['conn_name']
-                combobox.currentIndexChanged.connect(functools.partial(self.combo_slot, analog_output, conn_name))
-
-                #dac_range_widget.OutputName.setText(analog_output)
+                conn_name = self.output_conn_names[analog_output]
+                combobox.currentIndexChanged.connect(functools.partial(self.update_output_range, analog_output, conn_name))
 
     @Slot(int)
     @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
-    def combo_slot(self, output_name, conn_name, index):
+    def update_output_range(self, output_name, conn_name, index):
+        """Called when new DAC output range selected in GUI."""
         board_number = OutputConnectionName.board_number(conn_name)
         channel_number = OutputConnectionName.channel_number(conn_name)
         range_min, range_max = self.DAC_ranges[index]
+
+        # update min/max in the analog_properties dict
         self.analog_properties[output_name]['min'] = range_min
         self.analog_properties[output_name]['max'] = range_max
+        # update the limits of the analog output widget
         self.AO_widgets[output_name].set_limits(range_min, range_max)
+
+        # communicate the new output properties to the the worker so it can send them to the device
         yield(self.queue_work(self.primary_worker, "update_output_properties", self.analog_properties, self.digital_properties))
         yield(self.queue_work(self.primary_worker, "send_output_range", board_number, channel_number, index))
 
     def style_widgets(self, AO_widgets, DO_widgets):
-        """ Apply stylesheets to widgets. """
+        """Apply stylesheets to widgets."""
         for output_name in DO_widgets:
             DO_widgets[output_name].setStyleSheet(DO_style)
 
     def initialise_workers(self):
         initial_values = self.get_front_panel_values()
-        # pass initial front panel values to worker for manual programming cache
 
+        # pass initial front panel values to worker for manual programming cache
         self.create_worker("main_worker", FPGADeviceWorker, {
                            'initial_values': initial_values,
                            'analog_properties': self.analog_properties,
                            'digital_properties': self.digital_properties,
+                           'output_names': self.output_names,
+                           'output_conn_names': self.output_conn_names
                            }
                            )
         self.primary_worker = "main_worker"
@@ -299,7 +315,7 @@ class FPGADeviceTab(DeviceTab):
         # self.add_secondary_worker("acquisition_worker")
 
     def get_child_from_connection_table(self, parent_device_name, port):
-        """ Return connection object for the output connected to an IntermediateDevice via the port specified. """
+        """Return connection object for the output connected to an IntermediateDevice via the port specified."""
 
         if parent_device_name == self.device_name:
             device_conn = self.connection_table.find_by_name(self.device_name)
@@ -318,10 +334,10 @@ class FPGADeviceTab(DeviceTab):
 
     @define_state(MODE_MANUAL | MODE_BUFFERED | MODE_TRANSITION_TO_BUFFERED | MODE_TRANSITION_TO_MANUAL, True)
     def status_monitor(self, notify_queue=None):
-        """ Get status of FPGA and update the widgets in BLACS accordingly. """
+        """Get status of FPGA and update the widgets in BLACS accordingly."""
         # When called with a queue, this function writes to the queue
-        # when the FPGA is waiting. This indicates the end of
-        # an experimental run.
+        # when the FPGA returns its finished byte (FPGAStates.shot_finished).
+        # This indicates the end of an experimental run.
         self.status = yield(self.queue_work(self.primary_worker, 'check_status'))
 
         if notify_queue is not None and self.status == FPGAStates.shot_finished:
@@ -379,23 +395,20 @@ class FPGADeviceWorker(Worker):
         self.reset = self.interface.reset
         self.send_parameter = self.interface.send_parameter
         self.send_output_range = self.interface.send_output_range
+        self.check_status = self.interface.check_status
 
         # cache for smart programming
-        # initial_values attr is created by the DeviceTab initialise_workers method
+        # initial_values attribute is created by the DeviceTab initialise_workers method
         # and reflects the initial state of the front panel values for manual_program to inspect
-        self.smart_cache = {'clocks': {}, 'data': {}, 'output_values': self.initial_values}
+        self.smart_cache = {'shot_reps': None, 'shot_period': None, 'clocks': {}, 'data': {}, 'output_values': self.initial_values}
 
     def update_output_properties(self, analog_properties, digital_properties):
         self.analog_properties = analog_properties
         self.digital_properties = digital_properties
 
-    def check_status(self):
-        # return '\x07'
-        return self.interface.check_status()
-
     def program_manual(self, values):
-        """ Program device to output values when not executing a buffered shot, ie. realtime mode. """
-        
+        """Program device to output values when not executing a buffered shot, ie. realtime mode."""
+
         modified_values = {}
 
         for output_name in values:
@@ -403,10 +416,7 @@ class FPGADeviceWorker(Worker):
 
             # only update output if it has changed
             if value != self.smart_cache['output_values'].get(output_name):
-                try:
-                    conn_name = self.analog_properties[output_name]['conn_name']
-                except KeyError:
-                    conn_name = self.digital_properties[output_name]['conn_name']
+                conn_name = self.output_conn_names[output_name]
 
                 output_type, board_number, channel_number, group_name = OutputConnectionName.decode(conn_name)
 
@@ -439,7 +449,7 @@ class FPGADeviceWorker(Worker):
 
             clocks = device_group['clocks']
             analog_data = device_group['analog_data']
-            limits = device_group['analog_limits']
+            #limits = device_group['analog_limits']
             waits = device_group['waits']
             wait_times = device_group['wait_times']
 
@@ -450,7 +460,6 @@ class FPGADeviceWorker(Worker):
             final_state = {}
 
             # send repeats/period
-            # shot_period = 2 * sum([(tick['reps']+1)*(tick['period']+1) for tick in clocks[clocks.keys()[0]]])
             shot_period = int(stop_time * clock_limit)
 
             # FIXME: this is a bit messy, can we just save the value at compile time?
@@ -464,26 +473,16 @@ class FPGADeviceWorker(Worker):
             self.interface.send_repeats_and_period(shot_reps, shot_period)
 
             # send the pseudoclocks
+            for i, output_conn_name in enumerate(clocks):
+                clock = clocks[output_conn_name].value
 
-            for i, output in enumerate(clocks):
-                clock = clocks[output].value
-
-                output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output)
-
+                output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output_conn_name)
                 # get the name of the output corresponding to the output channel name
-                if group_name != "placeholder":
-                    if output_type == "analog":
-                        output_name = filter(lambda x: x[1] == output, [(x, y['conn_name']) for x, y in self.analog_properties.items()])[0][0]
-                    elif output_type == "digital":
-                        output_name = filter(lambda x: x[1] == output, [(x, y['conn_name']) for x, y in self.digital_properties.items()])[0][0]
-                else:
-                    # placeholder outputs aren't listed in analog_properties, 
-                    # and they aren't a concern for smart programmng anyway as they're constant
-                    output_name = "placeholder"
+                output_name = self.output_names[output_conn_name]
 
                 # only send if it has changed or fresh program is requested
-                if fresh_program or np.any(clock != self.smart_cache['clocks'].get(output)):
-                    self.smart_cache['clocks'][output] = clock
+                if fresh_program or np.any(clock != self.smart_cache['clocks'].get(output_name)):
+                    self.smart_cache['clocks'][output_name] = clock
                     logger.debug("i.send_pseudoclock(board_number={}, channel_number={}, clock={})".format(board_number, channel_number, clock))
                     self.interface.send_pseudoclock(board_number, channel_number, clock=clock)
 
@@ -496,38 +495,25 @@ class FPGADeviceWorker(Worker):
             self.interface.send_buffer(clocks_chunksize, clocks_delay)
 
             # send the analog data
-            for i, output in enumerate(analog_data):
+            for i, output_conn_name in enumerate(analog_data):
 
-   
-                data = analog_data[output].value
+                # get the name of the output corresponding to the output channel name
+                output_name = self.output_names[output_conn_name]
+
+                data = analog_data[output_conn_name].value
                 # only send if it has changed or fresh program is requested
-                if fresh_program or np.any(data != self.smart_cache['data'].get(output)):
-
-                    # FIXME: duplicated from above
-                    output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output)
-
-                    # get the name of the output corresponding to the output channel name
-                    if group_name != "placeholder":
-                        if output_type == "analog":
-                            output_name = filter(lambda x: x[1] == output, [(x, y['conn_name']) for x, y in self.analog_properties.items()])[0][0]
-                        elif output_type == "digital":
-                            output_name = filter(lambda x: x[1] == output, [(x, y['conn_name']) for x, y in self.digital_properties.items()])[0][0]
-                    else:
-                        # placeholder outputs aren't listed in analog_properties, 
-                        # and they aren't a concern for smart programmng anyway as they're constant
-                        output_name = "placeholder"
-
+                if fresh_program or np.any(data != self.smart_cache['data'].get(output_name)):
 
                     final_state[output_name] = data[-1]
-                    self.smart_cache['data'][output] = data
-    
+                    self.smart_cache['data'][output_name] = data
+
                     # FIXME: better not to send range at all for digi
                     try:
                         range_min, range_max = self.analog_properties[output_name]['min'], self.analog_properties[output_name]['max']
                     except KeyError:
                         range_min, range_max = 0, 5
 
-                    output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output)
+                    output_type, board_number, channel_number, group_name = OutputConnectionName.decode(output_conn_name)
                     logger.debug("i.send_analog_data(board_number={}, channel_number={}, "
                                  "range_min={}, range_max={}, data={})".format(board_number, channel_number, range_min, range_max, data))
                     self.interface.send_analog_data(board_number, channel_number, range_min, range_max, data)
@@ -590,7 +576,7 @@ class FPGARunViewerParser:
             #self.clock_resolution = f['devices'][self.device_name].attrs['clock_resolution']
 
         connection_table = ConnectionTable(path)
-        self.output_port_names = [i[1] for i in get_output_port_names(connection_table, self.device_name)]
+        self.output_conn_names = get_output_conn_names(connection_table, self.device_name).values()
 
     def get_traces(self, add_trace, clock=None):
         with h5py.File(self.path, 'r') as f:

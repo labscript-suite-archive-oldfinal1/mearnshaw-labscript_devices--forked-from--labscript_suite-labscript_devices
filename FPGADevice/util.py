@@ -2,10 +2,10 @@
 import struct
 
 
-def get_output_port_names(connection_table, device_name):
-    """Return list of connection names of the outputs attached, by inspecting the connection table."""
+def get_output_conn_names(connection_table, device_name):
+    """Return dict mapping output names to their connection names, by inspecting the connection table."""
 
-    output_names = []
+    output_conn_names = {}
     device_conn = connection_table.find_by_name(device_name)
 
     # iterate over the pseudoclock connections and find the type of output ultimately attached to it
@@ -13,7 +13,23 @@ def get_output_port_names(connection_table, device_name):
         clockline_conn = pseudoclock_conn.child_list.values()[0]
         id_conn = clockline_conn.child_list.values()[0]
         output_conn = id_conn.child_list.values()[0]
-        output_names.append((output_conn.name, output_conn.parent_port))
+        output_conn_names[output_conn.name] = output_conn.parent_port
+
+    return output_conn_names
+
+
+def get_output_names(connection_table, device_name):
+    """Return dict mapping connection names to their output names, by inspecting the connection table."""
+
+    output_names = {}
+    device_conn = connection_table.find_by_name(device_name)
+
+    # iterate over the pseudoclock connections and find the type of output ultimately attached to it
+    for pseudoclock_conn in device_conn.child_list.values():
+        clockline_conn = pseudoclock_conn.child_list.values()[0]
+        id_conn = clockline_conn.child_list.values()[0]
+        output_conn = id_conn.child_list.values()[0]
+        output_names[output_conn.parent_port] = output_conn.name
 
     return output_names
 

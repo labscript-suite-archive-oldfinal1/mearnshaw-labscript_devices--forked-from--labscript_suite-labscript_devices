@@ -14,7 +14,7 @@ from labscript_devices.FPGADevice.util import value_to_bytes, quantize_analog_va
 
 logger = logging.getLogger('main')
 logger.setLevel(logging.DEBUG)
-file_handler = logging.FileHandler('~/sequence.log')
+file_handler = logging.FileHandler('sequence.log')
 file_handler.setLevel(logging.DEBUG)
 stream_handler = logging.StreamHandler()
 stream_handler.setLevel(logging.DEBUG)
@@ -107,7 +107,7 @@ class FPGAInterface:
         ftdi.usb_purge_buffers(self.c)
         ftdi.set_bitmode(self.c, 0xFF, ftdi.BITMODE_SYNCFF)
 
-        ftdi.write_data_set_chunksize(self.c, 256)
+        ftdi.write_data_set_chunksize(self.c, 512)
 
         # more efficient to send as much data as possible in a single write,
         # see FTDI Technical Note TN_103 for more info, hence write_buffer
