@@ -7,7 +7,7 @@ setup(
         packages = find_packages(),
         install_requires = ['h5py', 'labscript_utils', 'zprocess',
                             'spinapi', 'PyDAQmx',
-                            'numpy', 'labscript', 'PySide', 'pyzmq==13.1.0']
+                            'labscript', 'PySide', 'pyzmq==13.1.0']
 
 )
 
