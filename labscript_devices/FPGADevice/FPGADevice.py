@@ -25,7 +25,6 @@ import numpy as np
 import re
 import logging
 import functools
-import random
 
 clocks_chunksize = 512
 clocks_delay = None
@@ -180,11 +179,6 @@ class FPGADevice(PseudoclockDevice):
             # we only need to save analog data, digital outputs are
             # constructed from the clocks/toggles clocking signal
             if isinstance(output, FPGAAnalogOut):
-                # FIXME: remove
-                diff = int((2.0**16 - 1) - len(output.raw_output))
-                if diff > 0:
-                    output.raw_output = np.append(output.raw_output, np.linspace(random.randint(3, 5), random.randint(0, 2), diff))
-
                 if len(output.raw_output) > self.max_analog_data:
                     raise LabscriptError("Cannot exceed more than {} analog data"
                                          "points per channel ({} requested)".format(self.max_analog_data, len(output.raw_output)))
